@@ -3,6 +3,9 @@
 Linux-first local network discovery and device intelligence, with a CLI-first
 design and an optional terminal UI.
 
+<img width="500" height="300" alt="find-a-rat-banner" src="https://github.com/user-attachments/assets/f91fd2b0-efb4-405d-a962-060c45d63666" />
+
+
 `findarat` discovers hosts on your local IPv4 network, records what it actually
 observed, infers device properties from attributable evidence, and keeps a
 historical SQLite inventory. Every inference carries a confidence level and a
