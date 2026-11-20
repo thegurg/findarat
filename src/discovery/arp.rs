@@ -22,6 +22,13 @@ use super::{DiscoveredHost, DiscoveryContext, DiscoveryProvider, ProviderOutput}
 
 pub struct ArpDiscovery;
 
+/// Number of addresses ARP would probe if no safety cap were applied.
+fn usable_probe_count(subnet: &crate::network::Subnet, local_ip: Ipv4Addr) -> u64 {
+    subnet
+        .host_count()
+        .saturating_sub(u64::from(subnet.contains(local_ip)))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArpEntry {
     pub ip: Ipv4Addr,
@@ -89,7 +96,9 @@ impl DiscoveryProvider for ArpDiscovery {
             .hosts_excluding(&[local_ip])
             .take(context.max_hosts)
             .collect();
-        let truncated = subnet.host_count() > hosts.len() as u64;
+        // The local address is excluded from priming, so it must also be
+        // excluded from the "did we cover the whole subnet?" comparison.
+        let truncated = usable_probe_count(&subnet, local_ip) > hosts.len() as u64;
 
         let socket = Arc::new(
             UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0)))
@@ -179,6 +188,7 @@ impl DiscoveryProvider for ArpDiscovery {
         Ok(ProviderOutput {
             hosts: discovered,
             note,
+            complete_subnet_enumeration: !truncated,
         })
     }
 }
@@ -208,5 +218,22 @@ IP address       HW type     Flags       HW address            Mask     Device
     fn malformed_lines_are_skipped() {
         let content = "header\nbad\n";
         assert!(parse_arp_table(content).is_empty());
+    }
+
+    #[test]
+    fn probe_count_excludes_only_the_local_address() {
+        let subnet = crate::network::Subnet::parse("192.168.1.0/24").unwrap();
+        let local = Ipv4Addr::new(192, 168, 1, 10);
+        assert_eq!(usable_probe_count(&subnet, local), 253);
+
+        // When the local address is outside the explicit scan subnet, every
+        // usable address is a probe target.
+        assert_eq!(usable_probe_count(&subnet, Ipv4Addr::new(10, 0, 0, 1)), 254);
+
+        let point_to_point = crate::network::Subnet::parse("192.0.2.4/31").unwrap();
+        assert_eq!(
+            usable_probe_count(&point_to_point, Ipv4Addr::new(192, 0, 2, 4)),
+            1
+        );
     }
 }

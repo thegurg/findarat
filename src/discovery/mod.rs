@@ -214,11 +214,19 @@ fn merge_json(target: &mut serde_json::Value, other: serde_json::Value) {
 pub struct ProviderOutput {
     pub hosts: Vec<DiscoveredHost>,
     pub note: Option<String>,
+    /// True only when this provider exhaustively enumerated the requested
+    /// subnet. Discovery providers that merely listen for advertisements must
+    /// leave this false: silence from them does not prove a host is absent.
+    pub complete_subnet_enumeration: bool,
 }
 
 impl ProviderOutput {
     pub fn new(hosts: Vec<DiscoveredHost>) -> Self {
-        Self { hosts, note: None }
+        Self {
+            hosts,
+            note: None,
+            complete_subnet_enumeration: false,
+        }
     }
 }
 
@@ -253,6 +261,10 @@ impl Default for DiscoveryOptions {
 pub struct DiscoveryOutcome {
     pub hosts: Vec<DiscoveredHost>,
     pub reports: Vec<ProviderReport>,
+    /// True when ARP successfully probed every usable address in the scanned
+    /// subnet. Absence can only be inferred from an exhaustive enumeration, not
+    /// from a provider that merely listens for advertisements.
+    pub complete_subnet_enumeration: bool,
 }
 
 /// Run enabled providers concurrently and merge their results.
@@ -288,11 +300,15 @@ pub async fn run_discovery(
 
     let mut hosts = Vec::new();
     let mut reports = Vec::new();
+    let mut complete_subnet_enumeration = false;
     while let Some(joined) = tasks.join_next().await {
         match joined {
             Ok((name, result, duration)) => match result {
                 Ok(Ok(output)) => {
                     let count = output.hosts.len();
+                    if name == "arp" {
+                        complete_subnet_enumeration = output.complete_subnet_enumeration;
+                    }
                     hosts.extend(output.hosts);
                     reports.push(ProviderReport {
                         name,
@@ -347,6 +363,7 @@ pub async fn run_discovery(
     DiscoveryOutcome {
         hosts: merge_hosts(hosts),
         reports,
+        complete_subnet_enumeration,
     }
 }
 

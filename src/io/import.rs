@@ -251,8 +251,9 @@ fn apply_envelope(
     }
 
     let mut missing_change_devices: HashSet<i64> = HashSet::new();
-    for device in &envelope.devices {
-        if !has_identity(device) {
+    for source_device in &envelope.devices {
+        let mut device = source_device.clone();
+        if !has_identity(&device) {
             report.warnings.push(format!(
                 "skipped device {:?}: no IP, MAC, hostname, or identifier",
                 device.display_name()
@@ -267,7 +268,16 @@ fn apply_envelope(
             continue;
         }
 
-        let matched = database.find_match(device)?;
+        // Observation scan links refer to the source database. Re-link them to
+        // the local session ids after `import_session` has mapped them; an
+        // unmapped session is cleared rather than left dangling.
+        for observation in &mut device.observations {
+            observation.scan_id = observation
+                .scan_id
+                .and_then(|scan_id| session_map.get(&scan_id).copied());
+        }
+
+        let matched = database.find_match(&device)?;
         let old_id = device.id;
         let label = device.display_name();
 
@@ -296,7 +306,7 @@ fn apply_envelope(
                 continue;
             }
             let outcome = database.upsert_device_with_options(
-                device,
+                &device,
                 &UpsertOptions {
                     scan_id: None,
                     ports_scanned: false,
@@ -325,7 +335,7 @@ fn apply_envelope(
             });
         } else {
             let outcome = database.upsert_device_with_options(
-                device,
+                &device,
                 &UpsertOptions {
                     scan_id: None,
                     ports_scanned: false,
@@ -455,7 +465,7 @@ pub fn export_time(value: DateTime<Utc>) -> String {
 mod tests {
     use super::*;
     use crate::io::export::{self, ExportFormat};
-    use crate::models::{ChangeKind, Device, Evidence};
+    use crate::models::{ChangeKind, Device, Evidence, Observation};
     use tempfile::tempdir;
 
     fn sample_device(ip: &str, mac: &str, hostname: &str) -> Device {
@@ -607,6 +617,54 @@ mod tests {
         assert_eq!(report.changes_imported, 1);
         assert_eq!(destination.count_devices().unwrap(), 1);
         assert_eq!(destination.list_changes(None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn imports_sqlite_and_maps_observation_sessions() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("snapshot.db");
+        let mut source = Database::open_in_memory().unwrap();
+        let session = ScanSession::started(
+            Utc::now(),
+            Some("wlan0".to_string()),
+            Some("192.168.1.0/24".to_string()),
+        );
+        let source_session = source.create_scan_session(&session).unwrap();
+
+        let mut device = sample_device("192.168.1.10", "AA:BB:CC:DD:EE:01", "alpha");
+        let mut observation = Observation::new(Utc::now(), "arp");
+        observation.scan_id = Some(source_session);
+        observation.ip = device.last_ip;
+        device.observations.push(observation);
+        source
+            .upsert_device_with_options(
+                &device,
+                &UpsertOptions {
+                    scan_id: Some(source_session),
+                    record_changes: false,
+                    synthesize_observations: false,
+                    ..UpsertOptions::default()
+                },
+            )
+            .unwrap();
+        export::export(ExportFormat::Sqlite, &path, &source, true).unwrap();
+
+        let mut destination = Database::open_in_memory().unwrap();
+        import(
+            ImportFormat::Sqlite,
+            &path,
+            &mut destination,
+            ImportOptions::default(),
+        )
+        .unwrap();
+
+        let local_sessions = destination.list_scan_sessions(None).unwrap();
+        assert_eq!(local_sessions.len(), 1);
+        let local_session = local_sessions[0].id;
+        let imported = destination.list_devices_full().unwrap();
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].observations.len(), 1);
+        assert_eq!(imported[0].observations[0].scan_id, local_session);
     }
 
     #[test]

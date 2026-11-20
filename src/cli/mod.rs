@@ -281,6 +281,29 @@ fn open_database(loaded: &LoadedConfig) -> Result<Database> {
     })
 }
 
+/// Open the import destination without creating it for a dry run.
+///
+/// A dry run against an existing inventory must not change that inventory, and
+/// a dry run against a missing inventory must not create an empty database as a
+/// side effect. In the latter case matching runs against an empty in-memory
+/// database, which is exactly the state a real import would start from.
+fn open_database_for_import(loaded: &LoadedConfig, dry_run: bool) -> Result<Database> {
+    if !dry_run {
+        return open_database(loaded);
+    }
+    let path = loaded.database_path();
+    if path.exists() {
+        Database::open_read_only(path).with_context(|| {
+            format!(
+                "failed to open inventory {} read-only for dry run",
+                path.display()
+            )
+        })
+    } else {
+        Database::open_in_memory().context("failed to create in-memory dry-run inventory")
+    }
+}
+
 async fn run_scan(args: ScanArgs, loaded: &LoadedConfig, format: OutputFormat) -> Result<()> {
     let mut request = ScanRequest::from_config(&loaded.config)?;
     if let Some(interface) = args.interface {
@@ -778,7 +801,7 @@ fn run_import(args: ImportArgs, loaded: &LoadedConfig, format: OutputFormat) -> 
         "auto" => ImportFormat::from_path(&args.path),
         other => ImportFormat::parse(other)?,
     };
-    let mut database = open_database(loaded)?;
+    let mut database = open_database_for_import(loaded, args.dry_run)?;
     let report = io::import(
         import_format,
         &args.path,
@@ -856,22 +879,31 @@ fn run_interfaces(format: OutputFormat) -> Result<()> {
 }
 
 fn run_config(args: &ConfigArgs, cli: &Cli) -> Result<()> {
-    let paths = config::ConfigPaths::resolve(cli.config.as_deref(), cli.database.as_deref());
     let command = args.command.as_ref().unwrap_or(&ConfigCommand::Show);
     match command {
         ConfigCommand::Init { force } => {
+            // Resolve paths without loading the config so `init` can repair an
+            // invalid or unreadable configuration file.
+            let paths =
+                config::ConfigPaths::resolve(cli.config.as_deref(), cli.database.as_deref());
             LoadedConfig::write_default_template(&paths.config_file, *force)?;
             println!("wrote {}", paths.config_file.display());
         }
         ConfigCommand::Paths => {
+            let loaded = LoadedConfig::load(cli.config.as_deref(), cli.database.as_deref())?;
+            let format = cli
+                .format
+                .map(OutputFormat::from)
+                .unwrap_or(loaded.config.general.default_output);
+            let paths = &loaded.paths;
             let value = serde_json::json!({
                 "config_file": paths.config_file.display().to_string(),
                 "data_dir": paths.data_dir.display().to_string(),
                 "database": paths.database.display().to_string(),
             });
-            match cli.format.map(OutputFormat::from) {
-                Some(OutputFormat::Json) => print_json(&value)?,
-                _ => {
+            match format {
+                OutputFormat::Json => print_json(&value)?,
+                OutputFormat::Table => {
                     println!("config file: {}", paths.config_file.display());
                     println!("data dir:    {}", paths.data_dir.display());
                     println!("database:    {}", paths.database.display());
@@ -880,9 +912,13 @@ fn run_config(args: &ConfigArgs, cli: &Cli) -> Result<()> {
         }
         ConfigCommand::Show => {
             let loaded = LoadedConfig::load(cli.config.as_deref(), cli.database.as_deref())?;
-            match cli.format.map(OutputFormat::from) {
-                Some(OutputFormat::Json) => print_json(&loaded.config)?,
-                _ => {
+            let format = cli
+                .format
+                .map(OutputFormat::from)
+                .unwrap_or(loaded.config.general.default_output);
+            match format {
+                OutputFormat::Json => print_json(&loaded.config)?,
+                OutputFormat::Table => {
                     print!("{}", config::render_effective(&loaded.config)?);
                     if let Some(source) = &loaded.source {
                         eprintln!("# source: {}", source.display());

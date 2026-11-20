@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Gauge, Paragraph, Row, Table, Tabs, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -222,6 +222,51 @@ impl TuiApp {
         self.sessions = self.database.list_scan_sessions(Some(100))?;
         self.clamp_selection();
         Ok(())
+    }
+
+    fn accent_style(&self) -> Style {
+        if self.config.tui.show_colors {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        }
+    }
+
+    fn muted_style(&self) -> Style {
+        if self.config.tui.show_colors {
+            Style::default().fg(Color::Gray)
+        } else {
+            Style::default()
+        }
+    }
+
+    fn success_style(&self) -> Style {
+        if self.config.tui.show_colors {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        }
+    }
+
+    fn selected_style(&self) -> Style {
+        if self.config.tui.show_colors {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::REVERSED)
+        }
+    }
+
+    fn table_selection_style(&self) -> Style {
+        if self.config.tui.show_colors {
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::REVERSED)
+        }
     }
 
     fn filtered_indices(&self) -> Vec<usize> {

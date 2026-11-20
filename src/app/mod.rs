@@ -273,18 +273,22 @@ pub async fn run_scan(
         changes.extend(outcome.changes);
     }
 
-    let discovery_ok = outcome
-        .reports
-        .iter()
-        .any(|report| report.status == ProviderStatus::Ok);
-    if discovery_ok {
+    if outcome.complete_subnet_enumeration {
         let disappeared = database
-            .mark_disappeared(Some(session_id), &seen, Some(&active.name), now, Utc::now())
+            .mark_disappeared(
+                Some(session_id),
+                &seen,
+                Some(&active.name),
+                Some(subnet),
+                now,
+                Utc::now(),
+            )
             .context("failed to record disappeared devices")?;
         changes.extend(disappeared);
     } else {
         warnings.push(
-            "no discovery provider succeeded; disappeared-device detection was skipped".to_string(),
+            "disappeared-device detection was skipped: the scan did not exhaustively enumerate the subnet (ARP disabled, failed, or capped by max_hosts)"
+                .to_string(),
         );
     }
 

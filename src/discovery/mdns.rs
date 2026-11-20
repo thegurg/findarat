@@ -182,7 +182,11 @@ impl DiscoveryProvider for MdnsDiscovery {
             None
         };
 
-        Ok(ProviderOutput { hosts, note })
+        Ok(ProviderOutput {
+            hosts,
+            note,
+            complete_subnet_enumeration: false,
+        })
     }
 }
 

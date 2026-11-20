@@ -272,7 +272,11 @@ impl DiscoveryProvider for NetbiosDiscovery {
         } else {
             None
         };
-        Ok(ProviderOutput { hosts, note })
+        Ok(ProviderOutput {
+            hosts,
+            note,
+            complete_subnet_enumeration: false,
+        })
     }
 }
 

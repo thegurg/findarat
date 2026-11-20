@@ -20,6 +20,7 @@ use crate::models::{
     ScanStatus, ServiceObservation,
 };
 use crate::network::interface::normalise_mac;
+use crate::network::Subnet;
 
 use super::history::{self, ChangeRecord};
 use super::identity::{self, IdentityMatch, MatchBasis};
@@ -502,19 +503,17 @@ impl Database {
         let mut candidates = Vec::new();
 
         if let Some(mac) = mac {
-            let found = self
-                .conn
-                .query_row(
-                    "SELECT i.device_id FROM identifiers i JOIN devices d ON d.id = i.device_id
-                     WHERE i.kind = 'mac' AND i.value = ?1 ORDER BY d.last_seen DESC LIMIT 1",
-                    params![mac],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()?;
-            if let Some(device_id) = found {
+            let mut statement = self.conn.prepare(
+                "SELECT DISTINCT i.device_id FROM identifiers i JOIN devices d ON d.id = i.device_id
+                 WHERE i.kind = 'mac' AND i.value = ?1 ORDER BY d.last_seen DESC LIMIT 2",
+            )?;
+            let ids: Vec<i64> = statement
+                .query_map(params![mac], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if ids.len() == 1 {
                 let confidence = identity::mac_confidence(mac);
                 candidates.push(IdentityMatch {
-                    device_id,
+                    device_id: ids[0],
                     basis: MatchBasis::Mac,
                     confidence,
                     reason: if confidence == Confidence::High {
@@ -545,31 +544,36 @@ impl Database {
         }
 
         if let Some(ip) = ip {
-            let found = self
-                .conn
-                .query_row(
-                    "SELECT i.device_id, d.last_mac, d.last_seen FROM identifiers i
-                     JOIN devices d ON d.id = i.device_id
-                     WHERE i.kind = 'ip' AND i.value = ?1 LIMIT 1",
-                    params![ip.to_string()],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, Option<String>>(1)?,
-                            row.get::<_, String>(2)?,
-                        ))
-                    },
-                )
-                .optional()?;
-            if let Some((device_id, existing_mac, last_seen)) = found {
-                let last_seen = parse_ts(&last_seen)?;
+            // A shared or reused address is ambiguous. Only accept an IP
+            // match when exactly one device owns the identifier; otherwise the
+            // observation must become a new identity rather than an arbitrary
+            // merge. `EXISTS` checks every MAC identifier, including imported
+            // identifiers that are not mirrored into `devices.last_mac`.
+            let mut statement = self.conn.prepare(
+                "SELECT DISTINCT i.device_id, d.last_seen,
+                        EXISTS(
+                            SELECT 1 FROM identifiers m
+                            WHERE m.device_id = i.device_id AND m.kind = 'mac'
+                        )
+                 FROM identifiers i JOIN devices d ON d.id = i.device_id
+                 WHERE i.kind = 'ip' AND i.value = ?1
+                 LIMIT 2",
+            )?;
+            let rows: Vec<(i64, String, i64)> = statement
+                .query_map(params![ip.to_string()], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if rows.len() == 1 {
+                let (device_id, last_seen, existing_has_mac) = &rows[0];
+                let last_seen = parse_ts(last_seen)?;
                 let age = observed_at
                     .signed_duration_since(last_seen)
                     .to_std()
                     .unwrap_or_default();
-                if identity::ip_match_allowed(existing_mac.is_some(), mac.is_some(), age) {
+                if identity::ip_match_allowed(*existing_has_mac != 0, mac.is_some(), age) {
                     candidates.push(IdentityMatch {
-                        device_id,
+                        device_id: *device_id,
                         basis: MatchBasis::Ip,
                         confidence: Confidence::Low,
                         reason: format!("IP-only match ({ip}); identity uncertain"),
@@ -709,6 +713,7 @@ impl Database {
         scan_id: Option<i64>,
         seen: &HashSet<i64>,
         interface: Option<&str>,
+        subnet: Option<Subnet>,
         before: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> Result<Vec<Change>> {
@@ -739,6 +744,18 @@ impl Database {
             }
             if let Some(interface) = interface {
                 if device_interface.as_deref() != Some(interface) {
+                    continue;
+                }
+            }
+            if let Some(subnet) = subnet {
+                let Some(device_ip) = ip.as_deref().and_then(|value| value.parse::<IpAddr>().ok())
+                else {
+                    continue;
+                };
+                let IpAddr::V4(device_ip) = device_ip else {
+                    continue;
+                };
+                if !subnet.contains(device_ip) {
                     continue;
                 }
             }
@@ -861,6 +878,14 @@ fn write_children(
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(device_id, property, value, source) DO UPDATE SET
                  observed_at = CASE WHEN excluded.observed_at > evidence.observed_at THEN excluded.observed_at ELSE evidence.observed_at END,
+                 confidence = CASE
+                     WHEN CASE excluded.confidence WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END
+                       >= CASE evidence.confidence WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END
+                     THEN excluded.confidence ELSE evidence.confidence END,
+                 kind = CASE
+                     WHEN CASE excluded.confidence WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END
+                       >= CASE evidence.confidence WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END
+                     THEN excluded.kind ELSE evidence.kind END,
                  note = COALESCE(excluded.note, evidence.note)",
             params![
                 device_id,
@@ -906,9 +931,11 @@ fn write_children(
     for observation in &device.observations {
         let mut observation = observation.clone();
         observation.device_id = Some(device_id);
-        // Live scans pass their session id; imports pass `None` because the
-        // foreign scan session may not exist locally.
-        observation.scan_id = options.scan_id;
+        // Live scans attach their own session. Imports pass `None` after
+        // mapping foreign session ids, so the mapped value is preserved.
+        if options.scan_id.is_some() {
+            observation.scan_id = options.scan_id;
+        }
         insert_observation(transaction, device_id, &observation)?;
     }
 
@@ -1027,7 +1054,9 @@ fn update_existing_device(
     } else {
         existing.device_type
     };
-    let vendor = existing.vendor.clone().or_else(|| observed.vendor.clone());
+    // A vendor is tied to the observed MAC prefix. Prefer the current
+    // observation so a replaced NIC does not leave a stale vendor forever.
+    let vendor = observed.vendor.clone().or_else(|| existing.vendor.clone());
     let os = existing.os.clone().or_else(|| observed.os.clone());
     let interface = observed
         .interface
@@ -1788,17 +1817,149 @@ mod tests {
             .unwrap();
         let now = Utc::now() + chrono::Duration::seconds(5);
         let changes = db
-            .mark_disappeared(None, &HashSet::new(), Some("wlan0"), now, now)
+            .mark_disappeared(None, &HashSet::new(), Some("wlan0"), None, now, now)
             .unwrap();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].kind, ChangeKind::DeviceDisappeared);
         assert_eq!(db.count_active_devices().unwrap(), 0);
         let again = db
-            .mark_disappeared(None, &HashSet::new(), Some("wlan0"), now, now)
+            .mark_disappeared(None, &HashSet::new(), Some("wlan0"), None, now, now)
             .unwrap();
         assert!(again.is_empty());
         let loaded = db.get_device(outcome.device_id).unwrap().unwrap();
         assert!(!loaded.active);
+    }
+
+    #[test]
+    fn disappeared_detection_is_scoped_to_interface_and_subnet() {
+        let mut db = Database::open_in_memory().unwrap();
+        let local = db
+            .upsert_device(
+                &device("192.168.1.10", "AA:BB:CC:DD:EE:01", "alpha"),
+                None,
+                false,
+            )
+            .unwrap();
+        let mut other_interface = device("192.168.1.11", "AA:BB:CC:DD:EE:02", "beta");
+        other_interface.interface = Some("eth0".to_string());
+        let other_interface = db.upsert_device(&other_interface, None, false).unwrap();
+        let other_subnet = db
+            .upsert_device(
+                &device("10.0.0.5", "AA:BB:CC:DD:EE:03", "gamma"),
+                None,
+                false,
+            )
+            .unwrap();
+
+        let now = Utc::now() + chrono::Duration::seconds(5);
+        let changes = db
+            .mark_disappeared(
+                None,
+                &HashSet::new(),
+                Some("wlan0"),
+                Some(Subnet::parse("192.168.1.0/24").unwrap()),
+                now,
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].device_id, local.device_id);
+        assert!(!db.get_device(local.device_id).unwrap().unwrap().active);
+        assert!(
+            db.get_device(other_interface.device_id)
+                .unwrap()
+                .unwrap()
+                .active
+        );
+        assert!(
+            db.get_device(other_subnet.device_id)
+                .unwrap()
+                .unwrap()
+                .active
+        );
+    }
+
+    #[test]
+    fn ambiguous_ip_does_not_match_an_arbitrary_device() {
+        let mut db = Database::open_in_memory().unwrap();
+        let now = Utc::now();
+        db.upsert_device(
+            &device("192.168.1.60", "AA:BB:CC:DD:EE:10", "alpha"),
+            None,
+            false,
+        )
+        .unwrap();
+        db.upsert_device(
+            &device("192.168.1.60", "AA:BB:CC:DD:EE:11", "beta"),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut probe = Device::new(now, now);
+        probe.last_ip = Some("192.168.1.60".parse().unwrap());
+        assert!(db.find_match(&probe).unwrap().is_none());
+    }
+
+    #[test]
+    fn ip_match_checks_all_mac_identifiers() {
+        let mut db = Database::open_in_memory().unwrap();
+        let now = Utc::now();
+        let mut existing = Device::new(now, now);
+        existing.last_ip = Some("192.168.1.61".parse().unwrap());
+        existing.interface = Some("wlan0".to_string());
+        existing.add_identifier(Identifier::new(
+            IdentifierKind::Mac,
+            "AA:BB:CC:DD:EE:20".to_string(),
+            Confidence::High,
+            now,
+            now,
+        ));
+        db.upsert_device(&existing, None, false).unwrap();
+
+        let mut probe = Device::new(now, now);
+        probe.last_ip = Some("192.168.1.61".parse().unwrap());
+        probe.mac = Some("AA:BB:CC:DD:EE:21".to_string());
+        assert!(db.find_match(&probe).unwrap().is_none());
+    }
+
+    #[test]
+    fn repeated_evidence_upgrades_confidence_and_kind() {
+        let mut db = Database::open_in_memory().unwrap();
+        let now = Utc::now();
+        let mut first = device("192.168.1.62", "AA:BB:CC:DD:EE:30", "alpha");
+        first.evidence.clear();
+        first.add_evidence(Evidence::new(
+            "vendor",
+            "Example Vendor",
+            "oui",
+            Confidence::Low,
+            EvidenceKind::ProbabilisticInference,
+            now,
+        ));
+        let outcome = db.upsert_device(&first, None, false).unwrap();
+
+        let mut second = device("192.168.1.62", "AA:BB:CC:DD:EE:30", "alpha");
+        second.evidence.clear();
+        second.add_evidence(Evidence::new(
+            "vendor",
+            "Example Vendor",
+            "oui",
+            Confidence::High,
+            EvidenceKind::DirectObservation,
+            now + chrono::Duration::seconds(1),
+        ));
+        db.upsert_device(&second, None, false).unwrap();
+
+        let loaded = db.get_device(outcome.device_id).unwrap().unwrap();
+        let evidence = loaded
+            .evidence
+            .iter()
+            .find(|evidence| evidence.property == "vendor")
+            .unwrap();
+        assert_eq!(evidence.confidence, Confidence::High);
+        assert_eq!(evidence.kind, EvidenceKind::DirectObservation);
     }
 
     #[test]
