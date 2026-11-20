@@ -256,12 +256,16 @@ Default locations follow the XDG base directory specification:
 | --- | --- |
 | Config file | `$XDG_CONFIG_HOME/findarat/config.toml` (usually `~/.config/findarat/config.toml`) |
 | Data directory | `$XDG_DATA_HOME/findarat` (usually `~/.local/share/findarat`) |
-| Database | `$XDG_DATA_HOME/findarat/findarat.db` |
+| Database | `$XDG_DATA_HOME/findarat/findarat.db` when no config file exists |
 
 If no configuration file exists, built-in defaults are used. Unknown keys are
 ignored; invalid values are rejected with an actionable error. Relative
 `storage.database` paths are resolved against the config file's directory, and
 `~` is expanded.
+
+When a config file exists, its `storage.database` value is authoritative. The
+generated template uses `~/.local/share/findarat/findarat.db`; edit it if you
+use a different `XDG_DATA_HOME`. Passing `--database` overrides both.
 
 Generate the documented template with:
 
