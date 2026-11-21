@@ -193,7 +193,9 @@ CREATE TABLE evidence (
   duplicated.
 
 Evidence is additive. A stronger value does not delete weaker or conflicting
-evidence.
+evidence. When the same device/property/value/source claim is observed again,
+its `observed_at` advances and its `confidence` and `kind` are upgraded to the
+strongest claim; they are never silently downgraded by a weaker repeat.
 
 ### `ports`
 
@@ -307,7 +309,11 @@ Candidate order:
    - the previous sighting is at most seven days old.
 
 When multiple candidates exist, the highest confidence wins. Ties prefer MAC,
-then hostname, then IP. An IP address alone never proves identity.
+then hostname, then IP. An IP address alone never proves identity. A MAC,
+hostname, or IP value owned by more than one local device is ambiguous and does
+not produce a match; the observation becomes a new identity instead of being
+merged arbitrarily. IP conflict checks inspect every stored MAC identifier, not
+only the `devices.last_mac` display field.
 
 ## Domain model and JSON export
 
@@ -399,10 +405,12 @@ evidence_count,observation_count
    - Match against local identities.
    - Merge by default; skip with `--no-merge`.
    - Create when no identity matches.
-6. Re-link changes to local device and session ids. Changes whose device was
-   skipped are reported once as a warning.
+6. Re-link changes and observation `scan_id` values to local device and session
+   ids. Changes whose device was skipped are reported once as a warning.
 7. In `--dry-run` mode, perform matching and report counts without writing any
-   device, session, evidence, or change rows.
+   device, session, evidence, or change rows. A dry run against a missing
+   inventory uses an in-memory database and never creates the destination file;
+   against an existing inventory it opens the database read-only.
 
 Imports preserve historical timestamps. They do not synthesize observations
 and do not run change detection for imported snapshots.

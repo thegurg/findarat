@@ -382,19 +382,6 @@ fn apply_envelope(
         }
     }
 
-    if report.dry_run {
-        report.sessions_imported = envelope
-            .scan_sessions
-            .iter()
-            .filter(|session| {
-                session
-                    .id
-                    .map(|id| !session_map.contains_key(&id))
-                    .unwrap_or(true)
-            })
-            .count();
-    }
-
     Ok(report)
 }
 
@@ -509,6 +496,41 @@ mod tests {
         .unwrap();
         assert_eq!(report.devices_created, 1);
         assert_eq!(destination.count_devices().unwrap(), 0);
+    }
+
+    #[test]
+    fn dry_run_counts_sessions_that_would_be_created() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("export.json");
+        let mut source = Database::open_in_memory().unwrap();
+        let session = ScanSession::started(
+            Utc::now(),
+            Some("wlan0".to_string()),
+            Some("192.168.1.0/24".to_string()),
+        );
+        source.create_scan_session(&session).unwrap();
+        source
+            .upsert_device(
+                &sample_device("192.168.1.10", "AA:BB:CC:DD:EE:01", "alpha"),
+                None,
+                false,
+            )
+            .unwrap();
+        export_json(&source, &path);
+
+        let mut destination = Database::open_in_memory().unwrap();
+        let report = import(
+            ImportFormat::Json,
+            &path,
+            &mut destination,
+            ImportOptions {
+                dry_run: true,
+                merge: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.sessions_imported, 1);
+        assert_eq!(destination.list_scan_sessions(None).unwrap().len(), 0);
     }
 
     #[test]

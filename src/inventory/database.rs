@@ -503,17 +503,22 @@ impl Database {
         let mut candidates = Vec::new();
 
         if let Some(mac) = mac {
-            let mut statement = self.conn.prepare(
-                "SELECT DISTINCT i.device_id FROM identifiers i JOIN devices d ON d.id = i.device_id
-                 WHERE i.kind = 'mac' AND i.value = ?1 ORDER BY d.last_seen DESC LIMIT 2",
-            )?;
-            let ids: Vec<i64> = statement
-                .query_map(params![mac], |row| row.get(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            if ids.len() == 1 {
+            // A MAC is the strongest identifier. If historical data contains
+            // the same MAC on more than one device, prefer the most recently
+            // seen device rather than creating a third duplicate.
+            let found = self
+                .conn
+                .query_row(
+                    "SELECT i.device_id FROM identifiers i JOIN devices d ON d.id = i.device_id
+                     WHERE i.kind = 'mac' AND i.value = ?1 ORDER BY d.last_seen DESC LIMIT 1",
+                    params![mac],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            if let Some(device_id) = found {
                 let confidence = identity::mac_confidence(mac);
                 candidates.push(IdentityMatch {
-                    device_id: ids[0],
+                    device_id,
                     basis: MatchBasis::Mac,
                     confidence,
                     reason: if confidence == Confidence::High {

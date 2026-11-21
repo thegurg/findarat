@@ -646,7 +646,9 @@ impl TuiApp {
             return;
         }
         let format = ExportFormat::from_path(&path);
-        match io::export(format, &path, &self.database, true) {
+        // Match the CLI: never replace an existing file without an explicit
+        // confirmation mechanism.
+        match io::export(format, &path, &self.database, false) {
             Ok(report) => {
                 self.status = format!(
                     "exported {} device(s) to {} ({})",
@@ -713,12 +715,7 @@ impl TuiApp {
             .collect();
         let tabs = Tabs::new(titles)
             .select(self.screen.index())
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
+            .highlight_style(self.selected_style())
             .divider("|")
             .block(Block::bordered().title(format!("findarat — {}", self.network_summary)));
         frame.render_widget(tabs, area);
@@ -746,10 +743,7 @@ impl TuiApp {
         } else {
             format!("{} · {}", self.status, hints)
         };
-        frame.render_widget(
-            Paragraph::new(text).style(Style::default().fg(Color::Gray)),
-            area,
-        );
+        frame.render_widget(Paragraph::new(text).style(self.muted_style()), area);
     }
 
     fn render_dashboard(&self, frame: &mut Frame, area: Rect) {
@@ -768,19 +762,19 @@ impl TuiApp {
         });
         let mut lines = vec![
             Line::from(vec![
-                Span::styled("Network:  ", Style::default().fg(Color::Cyan)),
+                Span::styled("Network:  ", self.accent_style()),
                 Span::raw(self.network_summary.clone()),
             ]),
             Line::from(vec![
-                Span::styled("Database: ", Style::default().fg(Color::Cyan)),
+                Span::styled("Database: ", self.accent_style()),
                 Span::raw(self.database_path.display().to_string()),
             ]),
             Line::from(vec![
-                Span::styled("Devices:  ", Style::default().fg(Color::Cyan)),
+                Span::styled("Devices:  ", self.accent_style()),
                 Span::raw(format!("{} total, {active} active", self.devices.len())),
             ]),
             Line::from(vec![
-                Span::styled("Last scan:", Style::default().fg(Color::Cyan)),
+                Span::styled("Last scan:", self.accent_style()),
                 Span::raw(format!(
                     " {}",
                     last_scan.unwrap_or_else(|| "none".to_string())
@@ -823,9 +817,7 @@ impl TuiApp {
             .map(|(position, index)| {
                 let device = &self.devices[*index];
                 let style = if position == self.selected {
-                    Style::default()
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD)
+                    self.table_selection_style()
                 } else {
                     Style::default()
                 };
@@ -883,7 +875,7 @@ impl TuiApp {
             Row::new(vec![
                 "ID", "Name", "IP", "MAC", "Type", "Vendor", "Ports", "Active",
             ])
-            .style(Style::default().fg(Color::Cyan)),
+            .style(self.accent_style()),
         )
         .block(Block::bordered().title(title));
         frame.render_widget(table, area);
@@ -902,9 +894,7 @@ impl TuiApp {
         let mut lines = vec![
             Line::from(Span::styled(
                 device.display_name(),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                self.accent_style().add_modifier(Modifier::BOLD),
             )),
             Line::from(format!(
                 "ID: {}   IP: {}   MAC: {}   Active: {}",
@@ -1019,7 +1009,7 @@ impl TuiApp {
         .split(area);
         let status = vec![
             Line::from(vec![
-                Span::styled("State: ", Style::default().fg(Color::Cyan)),
+                Span::styled("State: ", self.accent_style()),
                 Span::raw(self.scan_state.label()),
             ]),
             Line::from(format!(
@@ -1057,7 +1047,7 @@ impl TuiApp {
         let mut lines = Vec::new();
         if let Some(result) = &self.scan_result {
             lines.push(Line::from(vec![
-                Span::styled("Last result: ", Style::default().fg(Color::Green)),
+                Span::styled("Last result: ", self.success_style()),
                 Span::raw(result.clone()),
             ]));
             lines.push(Line::from(""));
@@ -1144,9 +1134,7 @@ impl TuiApp {
         let lines = vec![
             Line::from(Span::styled(
                 "Import / Export",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                self.accent_style().add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(format!("Path: {}", self.io_path)),
@@ -1164,6 +1152,7 @@ impl TuiApp {
             Line::from("p  edit the path"),
             Line::from("x  toggle import dry-run"),
             Line::from(""),
+            Line::from("Existing export files are not overwritten; choose a new path."),
             Line::from("Exports never include credentials because findarat never collects them."),
             Line::from(""),
             Line::from(format!("Status: {}", self.status)),
@@ -1189,9 +1178,7 @@ impl TuiApp {
         let lines = vec![
             Line::from(Span::styled(
                 "Keyboard reference",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                self.accent_style().add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from("Tab / Shift+Tab   next / previous screen"),
@@ -1248,6 +1235,8 @@ pub async fn run(config: &Config, database_path: &Path) -> Result<()> {
 }
 
 async fn event_loop(terminal: &mut DefaultTerminal, app: &mut TuiApp) -> Result<()> {
+    let refresh_interval = Duration::from_millis(app.config.tui.refresh_interval_ms.max(100));
+    let mut last_refresh = Instant::now();
     loop {
         terminal.draw(|frame| app.render(frame))?;
         while event::poll(Duration::from_millis(0))? {
@@ -1258,6 +1247,14 @@ async fn event_loop(terminal: &mut DefaultTerminal, app: &mut TuiApp) -> Result<
         app.drain_scan_events();
         if app.should_quit {
             return Ok(());
+        }
+        if app.scan_state != ScanState::Running && last_refresh.elapsed() >= refresh_interval {
+            // Refresh from the inventory without letting a transient lock or
+            // read error tear down the terminal session.
+            if let Err(error) = app.refresh_all() {
+                tracing::warn!(%error, "background inventory refresh failed");
+            }
+            last_refresh = Instant::now();
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -1342,6 +1339,18 @@ mod tests {
         app.search = "does-not-exist".to_string();
         app.clamp_selection();
         assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn show_colors_config_controls_styling() {
+        let mut app = app_with_devices();
+        assert_ne!(app.accent_style(), Style::default());
+        app.config.tui.show_colors = false;
+        assert_eq!(
+            app.accent_style(),
+            Style::default().add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(app.muted_style(), Style::default());
     }
 
     #[test]

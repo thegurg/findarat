@@ -252,7 +252,7 @@ impl Default for DiscoveryOptions {
             mdns: true,
             ssdp: true,
             netbios: true,
-            timeout: Duration::from_millis(2500),
+            timeout: Duration::from_millis(5000),
         }
     }
 }
@@ -383,11 +383,20 @@ pub fn merge_hosts(hosts: Vec<DiscoveredHost>) -> Vec<DiscoveredHost> {
     let mut merged: Vec<DiscoveredHost> = Vec::new();
     for host in hosts {
         let position = merged.iter().position(|existing| {
-            (host.mac.is_some() && existing.mac.is_some() && host.mac == existing.mac)
-                || (host.ip.is_some() && existing.ip.is_some() && host.ip == existing.ip)
-                || (host.hostname.is_some()
+            if host.mac.is_some() && existing.mac.is_some() {
+                // Two different MACs at the same address are a conflict, not
+                // one host. Preserve both observations rather than silently
+                // discarding one MAC.
+                host.mac == existing.mac
+            } else if host.ip.is_some() && existing.ip.is_some() && host.ip == existing.ip {
+                // At least one side lacks a MAC, so the address is the best
+                // available join key and merging can fill in the missing MAC.
+                true
+            } else {
+                host.hostname.is_some()
                     && existing.hostname.is_some()
-                    && host.hostname == existing.hostname)
+                    && host.hostname == existing.hostname
+            }
         });
         match position {
             Some(index) => merged[index].merge(host),
@@ -449,6 +458,14 @@ mod tests {
         let merged = merge_hosts(vec![first, second]);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].ip.unwrap().to_string(), "192.168.1.10");
+    }
+
+    #[test]
+    fn conflicting_macs_at_one_ip_are_not_merged() {
+        let first = host("192.168.1.10", Some("AA:BB:CC:DD:EE:01"), None, "arp");
+        let second = host("192.168.1.10", Some("AA:BB:CC:DD:EE:02"), None, "ssdp");
+        let merged = merge_hosts(vec![first, second]);
+        assert_eq!(merged.len(), 2);
     }
 
     #[test]

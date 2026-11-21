@@ -26,7 +26,7 @@ arp = true
 mdns = true
 ssdp = true
 netbios = true
-timeout_ms = 2500              # per-provider timeout
+timeout_ms = 5000              # per-provider timeout
 resolve_hostnames = true       # reverse DNS for hosts without an advertised name
 
 [scanner]

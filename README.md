@@ -146,9 +146,10 @@ findarat scan --ports 1-1024 --concurrency 64 --rate-limit 200
 ```
 
 Discovery providers run concurrently. A provider that fails or times out is
-reported as failed while the remaining providers continue. If no discovery
-provider succeeds, disappeared-device detection is skipped and a warning is
-included in the report.
+reported as failed while the remaining providers continue. Disappeared-device
+detection requires a complete ARP enumeration of the scanned subnet. If ARP is
+disabled, fails, or is capped by `max_hosts`, the scan keeps existing devices
+active and includes a warning instead of inferring absence from partial data.
 
 Scan output includes per-provider status, the discovered devices, and any
 changes. With `--format json`, the report is a single JSON object containing
@@ -219,10 +220,11 @@ device objects. SQLite imports read an existing findarat database in read-only
 mode and reject importing a database into itself.
 
 Before writing, the import validates the schema version and device identities.
-`--dry-run` reports what would happen without modifying the destination.
-Devices that match an existing identity are merged by default; `--no-merge`
-skips them. Changes are re-linked to the imported devices, and history that
-cannot be linked is reported as a warning.
+`--dry-run` reports what would happen without modifying the destination and
+does not create a missing database as a side effect. Devices that match an
+existing identity are merged by default; `--no-merge` skips them. Changes and
+observation session links are re-linked to the imported devices and sessions,
+and history that cannot be linked is reported as a warning.
 
 ### `interfaces`
 
@@ -241,6 +243,9 @@ findarat config init [--force]
 `config init` writes the documented default template. It refuses to replace an
 existing file unless `--force` is supplied. Because `init` is handled before
 normal configuration loading, it can recover from an invalid config file.
+`config show` and `config paths` honor `general.default_output` unless
+`--format` is given; `config paths` reports the effective database after
+`storage.database`, XDG, and `--database` resolution.
 
 ### `tui`
 
@@ -286,7 +291,7 @@ arp = true
 mdns = true
 ssdp = true
 netbios = true
-timeout_ms = 2500              # per-provider timeout
+timeout_ms = 5000              # per-provider timeout
 resolve_hostnames = true       # reverse DNS for hosts without an advertised name
 
 [scanner]
@@ -427,7 +432,10 @@ port, service, session, and change tables are the historical record. See
 | `x` | Toggle import dry-run. |
 | `Esc` | Go back or leave an input mode. |
 
-Terminal state is restored on every exit path, including errors.
+Terminal state is restored on every exit path, including errors. The TUI
+refuses to overwrite an existing export file; choose a different path or remove
+the old file first. `tui.show_colors` controls color styling, and
+`tui.refresh_interval_ms` controls the background inventory refresh interval.
 
 ## Documentation
 

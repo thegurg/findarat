@@ -93,7 +93,7 @@ impl Default for DiscoveryConfig {
             mdns: true,
             ssdp: true,
             netbios: true,
-            timeout_ms: 2500,
+            timeout_ms: 5000,
             resolve_hostnames: true,
         }
     }

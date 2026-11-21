@@ -25,8 +25,8 @@ pub fn ip_change(old: Option<&str>, new: Option<&str>) -> Option<ChangeRecord> {
 }
 
 pub fn hostname_change(old: Option<&str>, new: Option<&str>) -> Option<ChangeRecord> {
-    let old_key = old.map(|value| value.trim_end_matches('.').to_ascii_lowercase());
-    let new_key = new.map(|value| value.trim_end_matches('.').to_ascii_lowercase());
+    let old_key = old.map(hostname_key);
+    let new_key = new.map(hostname_key);
     match (old_key, new_key) {
         (Some(old), Some(new)) if old != new => Some(ChangeRecord {
             kind: ChangeKind::HostnameChanged,
@@ -35,6 +35,17 @@ pub fn hostname_change(old: Option<&str>, new: Option<&str>) -> Option<ChangeRec
         }),
         _ => None,
     }
+}
+
+/// Normalise a hostname the same way identity matching does so that
+/// `printer`, `printer.local`, and `PRINTER.` are not reported as changes.
+fn hostname_key(value: &str) -> String {
+    let lower = value.trim_end_matches('.').to_ascii_lowercase();
+    lower
+        .strip_suffix(".local")
+        .unwrap_or(&lower)
+        .trim()
+        .to_string()
 }
 
 pub fn port_changes(old: &[PortObservation], new: &[PortObservation]) -> Vec<ChangeRecord> {
@@ -145,6 +156,8 @@ mod tests {
             ChangeKind::HostnameChanged
         );
         assert!(hostname_change(Some("alpha"), Some("ALPHA.")).is_none());
+        assert!(hostname_change(Some("alpha"), Some("alpha.local")).is_none());
+        assert!(hostname_change(Some("alpha.local"), Some("beta.local")).is_some());
     }
 
     #[test]

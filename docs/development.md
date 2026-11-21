@@ -52,8 +52,8 @@ The full suite currently consists of library unit tests and end-to-end CLI
 tests. A passing run looks like:
 
 ```text
-running 136 tests ... test result: ok
-running 9 tests ... test result: ok
+running 145 tests ... test result: ok
+running 12 tests ... test result: ok
 ```
 
 ## Test layout
@@ -213,8 +213,9 @@ not be used as strong evidence for randomised MAC addresses.
   `findarat config paths` to locate the database.
 - Use `findarat interfaces` when a scan cannot find an active interface.
 - A provider that times out is reported as `failed`; other providers continue.
-- If no discovery provider succeeds, disappeared-device detection is skipped
-  and the scan report includes a warning.
+- Disappeared-device detection runs only when ARP exhaustively enumerates the
+  scanned subnet. If ARP is disabled, fails, or is capped by `max_hosts`, the
+  scan report includes a warning and existing devices stay active.
 - SQLite runs in WAL mode with a five-second busy timeout. Remove stale
   `-wal`/`-shm` files only when no findarat process is using the database.
 

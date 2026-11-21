@@ -75,9 +75,10 @@ depend on `cli` or `tui`.
 6. **Fingerprint.** `fingerprint::apply` adds services and evidence, infers
    device type and OS, and sets display properties only when evidence supports
    them.
-7. **Persist.** A scan session is created, devices are upserted, changes are
-   recorded, and disappeared devices are marked when at least one discovery
-   provider succeeded.
+7. **Persist.** A scan session is created, devices are upserted, and changes
+   are recorded. Disappeared devices are marked only after ARP exhaustively
+   enumerates the scanned subnet; partial, failed, or disabled ARP leaves
+   existing devices active and adds a warning.
 8. **Report.** The final `ScanReport` is authoritative. Progress events are
    advisory and may arrive before persistence finishes.
 

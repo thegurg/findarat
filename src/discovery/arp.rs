@@ -68,10 +68,10 @@ pub fn parse_arp_table(content: &str) -> Vec<ArpEntry> {
     entries
 }
 
-fn read_arp_table() -> Vec<ArpEntry> {
-    fs::read_to_string("/proc/net/arp")
-        .map(|content| parse_arp_table(&content))
-        .unwrap_or_default()
+fn read_arp_table() -> anyhow::Result<Vec<ArpEntry>> {
+    let content = fs::read_to_string("/proc/net/arp")
+        .map_err(|error| anyhow::anyhow!("failed to read /proc/net/arp: {error}"))?;
+    Ok(parse_arp_table(&content))
 }
 
 #[async_trait]
@@ -90,7 +90,7 @@ impl DiscoveryProvider for ArpDiscovery {
             .ok_or_else(|| anyhow::anyhow!("interface has no IPv4 address"))?;
 
         // Capture entries that are already cached before priming.
-        let before = read_arp_table();
+        let before = read_arp_table()?;
 
         let hosts: Vec<Ipv4Addr> = subnet
             .hosts_excluding(&[local_ip])
@@ -105,23 +105,31 @@ impl DiscoveryProvider for ArpDiscovery {
                 .await
                 .map_err(|error| anyhow::anyhow!("failed to open ARP priming socket: {error}"))?,
         );
-        let mut tasks = JoinSet::new();
+        let mut tasks: JoinSet<bool> = JoinSet::new();
+        let mut send_failures = 0usize;
         for ip in &hosts {
             let socket = Arc::clone(&socket);
             let ip = *ip;
             tasks.spawn(async move {
-                let _ = socket.send_to(&[0u8], SocketAddr::from((ip, 9))).await;
+                socket
+                    .send_to(&[0u8], SocketAddr::from((ip, 9)))
+                    .await
+                    .is_ok()
             });
-            if tasks.len() >= 256 {
-                let _ = tasks.join_next().await;
+            if tasks.len() >= 256 && !matches!(tasks.join_next().await, Some(Ok(true))) {
+                send_failures += 1;
             }
         }
-        while tasks.join_next().await.is_some() {}
+        while let Some(joined) = tasks.join_next().await {
+            if !matches!(joined, Ok(true)) {
+                send_failures += 1;
+            }
+        }
 
         // Give the kernel time to complete ARP exchanges. This is intentionally
         // short; discovery should not stall the whole scan.
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let after = read_arp_table();
+        let after = read_arp_table()?;
 
         let mut seen = std::collections::BTreeSet::new();
         let mut discovered = Vec::new();
@@ -170,17 +178,21 @@ impl DiscoveryProvider for ArpDiscovery {
             discovered.push(host);
         }
 
-        let note = if discovered.is_empty() {
-            Some(
-                "no complete ARP entries appeared; hosts may be offline, client-isolated, or firewalled"
-                    .to_string(),
-            )
-        } else if truncated {
+        let note = if truncated {
             Some(format!(
                 "subnet has {} hosts; ARP priming limited to {}",
                 subnet.host_count(),
                 hosts.len()
             ))
+        } else if send_failures > 0 {
+            Some(format!(
+                "{send_failures} ARP priming send(s) failed; enumeration may be incomplete"
+            ))
+        } else if discovered.is_empty() {
+            Some(
+                "no complete ARP entries appeared; hosts may be offline, client-isolated, or firewalled"
+                    .to_string(),
+            )
         } else {
             None
         };
@@ -188,7 +200,7 @@ impl DiscoveryProvider for ArpDiscovery {
         Ok(ProviderOutput {
             hosts: discovered,
             note,
-            complete_subnet_enumeration: !truncated,
+            complete_subnet_enumeration: !truncated && send_failures == 0,
         })
     }
 }
