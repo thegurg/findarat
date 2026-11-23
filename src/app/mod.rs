@@ -41,6 +41,8 @@ pub struct ScanRequest {
     pub scan_options: ScanOptions,
     /// Safety cap for both subnet-wide probing and the TCP host list.
     pub max_hosts: usize,
+    /// Local user fingerprint rules, already loaded and validated.
+    pub rules: Vec<fingerprint::rules::Rule>,
 }
 
 impl ScanRequest {
@@ -48,6 +50,14 @@ impl ScanRequest {
         let ports = scanner::parse_ports(&config.scanner.default_ports).map_err(|error| {
             FindaratError::Config(format!("invalid scanner.default_ports: {error}"))
         })?;
+        let rules = if config.fingerprint.rules_file.trim().is_empty() {
+            Vec::new()
+        } else {
+            fingerprint::rules::RuleSet::load_optional(std::path::Path::new(
+                &config.fingerprint.rules_file,
+            ))?
+            .rules
+        };
         Ok(Self {
             interface: config.general.interface.clone(),
             subnet: None,
@@ -67,6 +77,7 @@ impl ScanRequest {
                 banner_grab: config.scanner.banner_grab,
             },
             max_hosts: config.scanner.max_hosts,
+            rules,
         })
     }
 }
@@ -223,6 +234,12 @@ pub async fn run_scan(
             .iter()
             .map(|service| service_observation(service, now))
             .collect();
+        let mdns_service_types: Vec<String> = host
+            .services
+            .iter()
+            .filter(|service| service.source == "mdns")
+            .filter_map(|service| service.service_type.clone())
+            .collect();
         let is_gateway = match (device.last_ip, gateway) {
             (Some(IpAddr::V4(ip)), Some(gateway)) => ip == gateway,
             _ => false,
@@ -234,7 +251,9 @@ pub async fn run_scan(
             ssdp_device_types: &host.ssdp_device_types,
             ssdp_manufacturer: host.ssdp_manufacturer.as_deref(),
             ssdp_model: host.ssdp_model.as_deref(),
+            mdns_service_types: &mdns_service_types,
             netbios_present: !host.netbios_names.is_empty(),
+            rules: &request.rules,
         };
         fingerprint::apply(device, &input);
     }
@@ -681,10 +700,50 @@ mod tests {
 
     #[test]
     fn request_from_config_uses_configured_ports() {
-        let config = Config::default();
+        let mut config = Config::default();
+        config.fingerprint.rules_file = String::new();
         let request = ScanRequest::from_config(&config).unwrap();
         assert!(request.ports.is_some());
         assert!(!request.ports.unwrap().is_empty());
+    }
+
+    #[test]
+    fn request_from_config_loads_valid_local_rules() {
+        let directory = tempfile::tempdir().unwrap();
+        let rules = directory.path().join("rules.toml");
+        std::fs::write(
+            &rules,
+            r#"
+[[rule]]
+name = "printer"
+device_type = "printer"
+any_ports = [9100]
+"#,
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.fingerprint.rules_file = rules.display().to_string();
+        let request = ScanRequest::from_config(&config).unwrap();
+        assert_eq!(request.rules.len(), 1);
+        assert_eq!(request.rules[0].name, "printer");
+    }
+
+    #[test]
+    fn request_from_config_rejects_invalid_rules() {
+        let directory = tempfile::tempdir().unwrap();
+        let rules = directory.path().join("rules.toml");
+        std::fs::write(
+            &rules,
+            r#"
+[[rule]]
+name = "printer"
+any_ports = [9100]
+"#,
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.fingerprint.rules_file = rules.display().to_string();
+        assert!(ScanRequest::from_config(&config).is_err());
     }
 
     #[test]

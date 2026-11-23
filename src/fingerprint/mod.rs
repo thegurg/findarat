@@ -8,6 +8,7 @@ pub mod device_type;
 pub mod hostname;
 pub mod os;
 pub mod oui;
+pub mod rules;
 pub mod services;
 
 use chrono::{DateTime, Utc};
@@ -22,7 +23,10 @@ pub struct FingerprintInput<'a> {
     pub ssdp_device_types: &'a [String],
     pub ssdp_manufacturer: Option<&'a str>,
     pub ssdp_model: Option<&'a str>,
+    pub mdns_service_types: &'a [String],
     pub netbios_present: bool,
+    /// Local user rules, applied after the built-in heuristics.
+    pub rules: &'a [rules::Rule],
 }
 
 /// Apply all available fingerprinting rules to a device.
@@ -157,6 +161,14 @@ pub fn apply(device: &mut Device, input: &FingerprintInput<'_>) {
             device.os = Some(best.os.to_string());
         }
     }
+
+    rules::apply(
+        device,
+        input.rules,
+        input.observed_at,
+        input.mdns_service_types,
+        input.ssdp_device_types,
+    );
 }
 
 fn apply_vendor(device: &mut Device, observed_at: DateTime<Utc>) {
@@ -256,7 +268,9 @@ mod tests {
             ssdp_device_types: &[],
             ssdp_manufacturer: None,
             ssdp_model: None,
+            mdns_service_types: &[],
             netbios_present: false,
+            rules: &[],
         };
         apply(&mut device, &input);
         assert!(device.vendor.as_deref().unwrap().contains("Raspberry Pi"));
@@ -278,7 +292,9 @@ mod tests {
             ssdp_device_types: &[],
             ssdp_manufacturer: None,
             ssdp_model: None,
+            mdns_service_types: &[],
             netbios_present: false,
+            rules: &[],
         };
         apply(&mut device, &input);
         assert!(device.vendor.is_none());
@@ -304,7 +320,9 @@ mod tests {
             ssdp_device_types: &[],
             ssdp_manufacturer: None,
             ssdp_model: None,
+            mdns_service_types: &[],
             netbios_present: false,
+            rules: &[],
         };
         apply(&mut device, &input);
         assert_eq!(device.device_type, DeviceType::Printer);
@@ -327,7 +345,9 @@ mod tests {
             ssdp_device_types: &[],
             ssdp_manufacturer: None,
             ssdp_model: None,
+            mdns_service_types: &[],
             netbios_present: false,
+            rules: &[],
         };
         apply(&mut device, &input);
         assert_eq!(device.services.len(), 1);

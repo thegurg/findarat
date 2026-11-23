@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 
 use crate::error::FindaratError;
 pub use settings::{
-    Config, DiscoveryConfig, GeneralConfig, OutputFormat, ScannerConfig, StorageConfig, TuiConfig,
+    Config, DiscoveryConfig, FingerprintConfig, GeneralConfig, OutputFormat, ScannerConfig,
+    StorageConfig, TuiConfig,
 };
 
 pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# findarat configuration
@@ -43,6 +44,11 @@ database = "~/.local/share/findarat/findarat.db"
 [tui]
 show_colors = true
 refresh_interval_ms = 1000
+
+[fingerprint]
+# Optional TOML rules, resolved relative to this file. Empty disables rules.
+# See the README for the rule format.
+rules_file = "rules.toml"
 "#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +122,12 @@ impl LoadedConfig {
             if resolved != paths.database {
                 paths.database = resolved;
             }
+        }
+
+        if !config.fingerprint.rules_file.trim().is_empty() {
+            let base = paths.config_file.parent();
+            let resolved = expand_path(&config.fingerprint.rules_file, base)?;
+            config.fingerprint.rules_file = resolved.display().to_string();
         }
 
         if let Some(interface) = &config.general.interface {
@@ -280,5 +292,17 @@ mod tests {
         fs::write(&path, "[scanner]\nconcurrency = 0\n").unwrap();
         let error = LoadedConfig::load(Some(&path), None).unwrap_err();
         assert!(error.to_string().contains("concurrency"));
+    }
+
+    #[test]
+    fn fingerprint_rules_path_resolves_against_the_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[fingerprint]\nrules_file = \"rules.toml\"\n").unwrap();
+        let loaded = LoadedConfig::load(Some(&path), None).unwrap();
+        assert_eq!(
+            loaded.config.fingerprint.rules_file,
+            dir.path().join("rules.toml").display().to_string()
+        );
     }
 }

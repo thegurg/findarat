@@ -6,8 +6,8 @@ independently of the application version.
 
 Current versions:
 
-- SQLite schema: `1` (`schema_meta.schema_version`).
-- Export/import envelope: `1` (`ExportEnvelope.schema_version`).
+- SQLite schema: `2` (`schema_meta.schema_version`).
+- Export/import envelope: `2` (`ExportEnvelope.schema_version`).
 - Application version: reported separately as `tool_version`.
 
 ## Design principles
@@ -56,8 +56,10 @@ CREATE TABLE schema_meta (
 ```
 
 On open, `findarat` reads the version, refuses versions newer than the build,
-applies the idempotent schema, and inserts version `1` for a new database.
-Existing databases are not downgraded or rewritten silently.
+applies the idempotent schema, and inserts version `2` for a new database.
+Opening a version `1` database adds the annotation columns to `devices` and
+updates the recorded version. Existing data is preserved; databases are never
+downgraded or rewritten silently.
 
 ### `scan_sessions`
 
@@ -93,6 +95,10 @@ CREATE TABLE devices (
     last_ip       TEXT,
     last_mac      TEXT,
     last_hostname TEXT,
+    label         TEXT,
+    notes         TEXT,
+    tags          TEXT NOT NULL DEFAULT '',
+    ignored       INTEGER NOT NULL DEFAULT 0,
     vendor        TEXT,
     device_type   TEXT NOT NULL DEFAULT 'unknown',
     os            TEXT,
@@ -109,6 +115,15 @@ most recent completed scan and `0` after disappeared-device detection.
 The device row is not the source of truth for identity. `last_ip`, `last_mac`,
 and `last_hostname` are display conveniences; use `identifiers` and
 `observations` for history.
+
+### Annotations
+
+`label`, `notes`, `tags`, and `ignored` are user-owned fields. They are never
+overwritten by a scan merge, although an import may fill a field that is empty
+locally. `label` takes precedence over the observed hostname in
+`Device::display_name()`. `tags` is a comma-separated, lower-case, sorted list in
+SQLite and a JSON array in exports. `ignored` keeps a device and its history but
+hides it from `devices --exclude-ignored` and the TUI ignored filter.
 
 ### `identifiers`
 
@@ -326,6 +341,10 @@ only the `devices.last_mac` display field.
   "mac": "AA:BB:CC:DD:EE:01",
   "vendor": "Example Vendor",
   "hostname": "printer",
+  "label": "Office printer",
+  "notes": "second floor",
+  "tags": ["office", "printer"],
+  "ignored": false,
   "device_type": "printer",
   "os": "Linux",
   "interface": "wlan0",
@@ -363,7 +382,7 @@ JSON export is a complete inventory document:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "tool": "findarat",
   "tool_version": "0.1.0",
   "exported_at": "2026-01-02T03:04:05Z",
@@ -382,11 +401,12 @@ outside `1..=SCHEMA_VERSION` are rejected.
 CSV is a flat device report, not a complete backup. The header is:
 
 ```text
-id,last_ip,mac,hostname,vendor,device_type,os,interface,
+id,last_ip,mac,hostname,label,notes,tags,ignored,vendor,device_type,os,interface,
 first_seen,last_seen,active,open_ports,services,identifiers,
 evidence_count,observation_count
 ```
 
+- `tags` is space-separated and `ignored` is a boolean.
 - `open_ports` is a comma-separated list of open TCP port numbers.
 - `services` is a human-readable service summary.
 - `identifiers` is `kind=value` pairs separated by `; `.

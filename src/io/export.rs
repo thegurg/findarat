@@ -164,6 +164,10 @@ struct CsvDeviceRow {
     last_ip: String,
     mac: String,
     hostname: String,
+    label: String,
+    notes: String,
+    tags: String,
+    ignored: bool,
     vendor: String,
     device_type: String,
     os: String,
@@ -199,6 +203,10 @@ fn export_csv(path: &Path, devices: &[Device]) -> Result<()> {
                 last_ip: device.last_ip.map(|ip| ip.to_string()).unwrap_or_default(),
                 mac: device.mac.clone().unwrap_or_default(),
                 hostname: device.hostname.clone().unwrap_or_default(),
+                label: device.label.clone().unwrap_or_default(),
+                notes: device.notes.clone().unwrap_or_default(),
+                tags: device.tags.join(" "),
+                ignored: device.ignored,
                 vendor: device.vendor.clone().unwrap_or_default(),
                 device_type: device.device_type.as_str().to_string(),
                 os: device.os.clone().unwrap_or_default(),
@@ -263,7 +271,7 @@ mod tests {
             .unwrap();
         export(ExportFormat::Csv, &path, &database, false).unwrap();
         let mut reader = csv::Reader::from_path(&path).unwrap();
-        assert_eq!(reader.headers().unwrap().len(), 16);
+        assert_eq!(reader.headers().unwrap().len(), 20);
         assert_eq!(reader.records().count(), 1);
     }
 

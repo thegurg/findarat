@@ -22,11 +22,15 @@ This is a working pre-1.0 implementation. The current milestone covers:
 - Unprivileged IPv4 discovery over ARP, mDNS/DNS-SD, SSDP/UPnP, and NetBIOS.
 - Bounded TCP port scanning with optional banner collection.
 - Evidence-based fingerprinting: vendor, hostname, device type, and OS.
+- Local TOML fingerprint rules that add evidence without overriding discovery.
+- User annotations (label, notes, tags, ignored) that survive rescans.
+- `explain` and per-device `timeline` views over the stored evidence/history.
 - SQLite inventory with identity matching, observations, evidence, history,
   and detected changes.
-- JSON, CSV, and SQLite export; JSON and SQLite import with validation,
-  dry-run, merge, and skip behavior.
-- CLI and TUI access to the same inventory and scan pipeline.
+- JSON, CSV, and SQLite export; JSON, SQLite, Nmap, and arp-scan import with
+  validation, dry-run, merge, and skip behavior.
+- CLI and TUI access to the same inventory and scan pipeline, including TUI
+  annotation editing and ignored-device filtering.
 
 Access-point management (deauthentication, AP configuration, or other
 disruptive wireless operations) is intentionally not implemented.
@@ -82,8 +86,15 @@ findarat scan --no-tcp --timeout-ms 800
 findarat devices
 findarat devices --active --search printer
 findarat device 192.168.1.10
+findarat explain 192.168.1.10
+findarat timeline 192.168.1.10 --limit 20
 findarat history
 findarat changes --kind device_added
+
+# Annotate devices without overwriting what discovery observed.
+findarat annotate 192.168.1.10 --name "Office printer" --tag office --tag printer
+findarat annotate 192.168.1.10 --notes "second floor" --ignore
+findarat devices --tag office --exclude-ignored
 
 # Export and re-import.
 findarat export inventory.json
@@ -91,6 +102,10 @@ findarat export inventory.csv --export-format csv
 findarat export snapshot.db --export-format sqlite
 findarat import inventory.json --dry-run
 findarat import inventory.json
+
+# Import results produced by other tools.
+findarat import nmap-scan.xml
+findarat import arp-scan.txt --import-format arp-scan
 
 # Open the TUI.
 findarat tui
@@ -158,18 +173,55 @@ the session, devices, changes, provider reports, warnings, and elapsed time.
 ### `devices`
 
 ```text
-findarat devices [--active] [--search TEXT] [--sort FIELD] [--limit N]
+findarat devices [--active] [--search TEXT] [--tag TAG] [--exclude-ignored]
+                 [--sort FIELD] [--limit N]
 ```
 
 `--sort` accepts `last_seen`, `first_seen`, `ip`, `name`, `type`, `vendor`, or
 `id`. Search is case-insensitive across names, addresses, vendor, type, OS, and
-interface.
+interface. `--tag` matches one normalised tag, and `--exclude-ignored` hides
+devices marked ignored. Ignored devices are shown by default so annotations do
+not make inventory disappear silently.
 
 ### `device <TARGET>`
 
-Show one device, including identifiers, ports, services, evidence, and recent
-observations. `TARGET` may be a device id, IP address, MAC address, or
+Show one device, including annotations, identifiers, ports, services, evidence,
+and recent observations. `TARGET` may be a device id, IP address, MAC address, or
 hostname. A missing device exits with code `3`.
+
+### `annotate <TARGET>`
+
+```text
+findarat annotate <TARGET> [--name NAME] [--clear-name]
+                            [--notes TEXT] [--clear-notes]
+                            [--tag TAG]... [--untag TAG]...
+                            [--ignore] [--unignore] [--clear]
+```
+
+Annotations are user-owned and authoritative. A label replaces the hostname as
+the display name, but the observed hostname and all evidence remain available.
+Tags are normalised to lower case, de-duplicated, and sorted. `--clear` resets
+the label, notes, tags, and ignored flag; it cannot be combined with other
+annotation flags.
+
+Annotations survive rescans. Scan merges never overwrite a local label, notes,
+tags, or ignored flag, although an import may fill an annotation field that is
+empty locally. Marking a device ignored keeps its history but hides it from
+`--exclude-ignored` views and is reserved for future alerting.
+
+### `explain <TARGET>`
+
+Show the identity claims and inferred properties behind one device, grouped by
+property. Each property lists every claim with its value, source, confidence,
+and evidence kind. Conflicting claims are listed separately, and warnings call
+out missing or weak evidence. `--format json` emits the same structure for
+scripting.
+
+### `timeline <TARGET>`
+
+Show a device's observations and recorded changes in chronological order.
+`--limit N` keeps the most recent events. The JSON form includes the full event
+list plus counts for observations, changes, and sessions seen.
 
 ### `history`
 
@@ -201,30 +253,41 @@ without `--force`.
 CSV columns:
 
 ```text
-id, last_ip, mac, hostname, vendor, device_type, os, interface,
-first_seen, last_seen, active, open_ports, services, identifiers,
-evidence_count, observation_count
+id, last_ip, mac, hostname, label, notes, tags, ignored, vendor, device_type,
+os, interface, first_seen, last_seen, active, open_ports, services,
+identifiers, evidence_count, observation_count
 ```
 
-CSV is an interchange/reporting format for devices. It does not contain scan
-sessions or change history; use JSON or SQLite for a complete backup.
+`tags` is space-separated in CSV and `ignored` is a boolean. CSV is an
+interchange/reporting format for devices. It does not contain scan sessions or
+change history; use JSON or SQLite for a complete backup.
 
 ### `import <PATH>`
 
 ```text
-findarat import <PATH> [--import-format auto|json|sqlite] [--dry-run] [--no-merge]
+findarat import <PATH> [--import-format auto|json|sqlite|nmap|arp-scan]
+                        [--dry-run] [--no-merge]
 ```
 
 JSON imports accept either a versioned export envelope or a bare array of
 device objects. SQLite imports read an existing findarat database in read-only
-mode and reject importing a database into itself.
+mode and reject importing a database into itself. Nmap imports read XML produced
+by `nmap -oX`, and arp-scan imports read the plain-text output of `arp-scan`.
+Neither external format is executed; only hosts, addresses, ports, service
+guesses, and OS matches are read.
+
+The format is inferred from the extension unless `--import-format` is given:
+`.json`, `.db`/`.sqlite`/`.sqlite3`, `.xml` for Nmap, and `.arp`/`.arpscan` for
+arp-scan.
 
 Before writing, the import validates the schema version and device identities.
 `--dry-run` reports what would happen without modifying the destination and
 does not create a missing database as a side effect. Devices that match an
 existing identity are merged by default; `--no-merge` skips them. Changes and
 observation session links are re-linked to the imported devices and sessions,
-and history that cannot be linked is reported as a warning.
+and history that cannot be linked is reported as a warning. Previewing an older
+SQLite inventory migrates an in-memory copy, so the source file is never
+modified.
 
 ### `interfaces`
 
@@ -308,6 +371,10 @@ database = "~/.local/share/findarat/findarat.db"
 [tui]
 show_colors = true
 refresh_interval_ms = 1000
+
+[fingerprint]
+# Optional TOML rules, resolved relative to this file. Empty disables rules.
+rules_file = "rules.toml"
 ```
 
 Validation ranges:
@@ -320,6 +387,8 @@ Validation ranges:
 - `tui.refresh_interval_ms`: 100 to 60000.
 - `general.log_level`: `error`, `warn`, `info`, `debug`, or `trace`.
 - `scanner.default_ports` must be a valid port specification.
+- `fingerprint.rules_file` is resolved against the config file; an empty value
+  disables local rules. A missing file is treated as an empty rule set.
 
 `RUST_LOG` can override the configured log filter for diagnostics. Logs are
 written to stderr.
@@ -403,12 +472,53 @@ Direct observations are never overwritten by guesses. When multiple rules
 disagree, the strongest evidence wins for the displayed value and the
 alternatives remain visible as evidence.
 
+### Local fingerprint rules
+
+Add evidence and fill inferred properties with a TOML rule file. The default
+path is `rules.toml` next to the configuration file; set
+`fingerprint.rules_file` to change it or to `""` to disable local rules. Rules
+are applied after the built-in heuristics and never remove evidence.
+
+```toml
+[[rule]]
+name = "office printer"
+device_type = "printer"
+confidence = "medium"
+any_ports = [631, 9100]
+hostname_contains = ["printer", "hp-"]
+note = "matched the office printer port set"
+
+[[rule]]
+name = "home server"
+device_type = "server"
+os = "Linux"
+all_ports = [22, 443]
+mdns_service_contains = ["_ssh"]
+```
+
+Each rule needs a unique `name`, at least one condition, and at least one
+outcome. Conditions are:
+
+- `any_ports`: at least one listed open port.
+- `all_ports`: every listed port is open.
+- `hostname_contains`, `vendor_contains`, `banner_contains`,
+  `service_contains`, `mdns_service_contains`, `ssdp_type_contains`: any
+  case-insensitive substring match.
+
+Outcomes are `device_type` (using the same names as `--sort type`),
+`os`, `vendor`, and `model`. `confidence` defaults to `medium` and may be
+`high`, `medium`, `low`, or `unknown`. Invalid files, unknown keys, duplicate
+rule names, empty conditions, and invalid device types are rejected with a
+config error before a scan starts.
+
 ## Data storage
 
 The inventory is a SQLite database in WAL mode with foreign keys enabled and a
 five-second busy timeout. Schema versioning is stored in `schema_meta`. The
-current schema version is `1`. A database created by a newer build is rejected
-with an upgrade message instead of being modified.
+current schema version is `2`. Opening a v1 database migrates it in place by
+adding the annotation columns (`label`, `notes`, `tags`, `ignored`); a database
+created by a newer build is rejected with an upgrade message instead of being
+modified.
 
 The last-known device row is a convenience snapshot. The observation, evidence,
 port, service, session, and change tables are the historical record. See
@@ -426,11 +536,18 @@ port, service, session, and change tables are the historical record. See
 | `Enter` | Open details, start a scan, or confirm an action. |
 | `/` | Search devices. |
 | `s` | Cycle sort mode (Devices) or start a scan (Scan). |
+| `i` | Hide/show ignored devices (Devices) or toggle ignored (Details). |
+| `l` / `n` / `t` | Edit the label / notes / tags of the selected device (Details). |
 | `r` | Refresh or reload. |
-| `e` / `i` | Export / import using the current path. |
+| `e` / `i` | Export / import using the current path (Import/Export). |
 | `p` | Edit the import/export path. |
 | `x` | Toggle import dry-run. |
 | `Esc` | Go back or leave an input mode. |
+
+The details screen shows annotations alongside identifiers, ports, evidence, and
+observations. Annotation edits are saved immediately; Enter confirms an edit,
+Esc cancels, and an empty value clears the field. Tags are entered
+comma-separated.
 
 Terminal state is restored on every exit path, including errors. The TUI
 refuses to overwrite an existing export file; choose a different path or remove

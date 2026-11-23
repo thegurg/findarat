@@ -25,7 +25,7 @@ use crate::network::Subnet;
 use super::history::{self, ChangeRecord};
 use super::identity::{self, IdentityMatch, MatchBasis};
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -55,7 +55,11 @@ CREATE TABLE IF NOT EXISTS devices (
     interface TEXT,
     active INTEGER NOT NULL DEFAULT 1,
     first_seen TEXT NOT NULL,
-    last_seen TEXT NOT NULL
+    last_seen TEXT NOT NULL,
+    label TEXT,
+    notes TEXT,
+    tags TEXT NOT NULL DEFAULT '',
+    ignored INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_devices_last_seen ON devices(last_seen);
 CREATE INDEX IF NOT EXISTS idx_devices_interface ON devices(interface);
@@ -151,6 +155,31 @@ CREATE INDEX IF NOT EXISTS idx_changes_detected ON changes(detected_at);
 CREATE INDEX IF NOT EXISTS idx_changes_device ON changes(device_id, detected_at);
 "#;
 
+/// Partial update to user-owned device annotations.
+#[derive(Debug, Clone, Default)]
+pub struct AnnotationPatch {
+    /// `Some("")` clears the label; `None` leaves it unchanged.
+    pub label: Option<String>,
+    /// `Some("")` clears the notes; `None` leaves them unchanged.
+    pub notes: Option<String>,
+    pub add_tags: Vec<String>,
+    pub remove_tags: Vec<String>,
+    /// Remove every existing tag before applying additions.
+    pub clear_tags: bool,
+    pub ignored: Option<bool>,
+}
+
+impl AnnotationPatch {
+    pub fn is_empty(&self) -> bool {
+        self.label.is_none()
+            && self.notes.is_none()
+            && self.add_tags.is_empty()
+            && self.remove_tags.is_empty()
+            && !self.clear_tags
+            && self.ignored.is_none()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UpsertOptions {
     pub scan_id: Option<i64>,
@@ -228,6 +257,61 @@ impl Database {
         })
     }
 
+    /// Open a consistent in-memory copy of an existing database and migrate
+    /// the copy. The source file is never modified. Used by import previews so
+    /// an older inventory can be read with the current schema.
+    pub fn open_copy(path: &Path) -> Result<Self> {
+        let source = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .with_context(|| format!("failed to open database {} for copying", path.display()))?;
+        let mut destination =
+            Connection::open_in_memory().context("failed to create in-memory database copy")?;
+        let backup = rusqlite::backup::Backup::new(&source, &mut destination)
+            .with_context(|| format!("failed to copy database {}", path.display()))?;
+        backup
+            .run_to_completion(100, Duration::from_millis(1), None)
+            .with_context(|| format!("failed to copy database {}", path.display()))?;
+        drop(backup);
+        drop(source);
+        let mut database = Self {
+            conn: destination,
+            path: path.to_path_buf(),
+        };
+        database.configure()?;
+        // The copy is migrated below, but only if it is actually a findarat
+        // database. Otherwise a foreign SQLite file would silently look empty.
+        let version: Option<String> = if database.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )? {
+            database
+                .conn
+                .query_row(
+                    "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .with_context(|| {
+                    format!("failed to read schema version from {}", path.display())
+                })?
+        } else {
+            None
+        };
+        if version.is_none() {
+            return Err(FindaratError::Database(format!(
+                "{} is not a findarat database",
+                path.display()
+            ))
+            .into());
+        }
+        database.migrate()?;
+        Ok(database)
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -293,13 +377,55 @@ impl Database {
         self.conn
             .execute_batch(SCHEMA_SQL)
             .context("failed to apply database schema")?;
-        if existing.is_none() {
-            self.conn
-                .execute(
-                    "INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?1)",
-                    params![SCHEMA_VERSION.to_string()],
-                )
-                .context("failed to record database schema version")?;
+        if existing.unwrap_or(0) < 2 {
+            self.ensure_annotation_columns()?;
+        }
+        match existing {
+            None => {
+                self.conn
+                    .execute(
+                        "INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?1)",
+                        params![SCHEMA_VERSION.to_string()],
+                    )
+                    .context("failed to record database schema version")?;
+            }
+            Some(version) if version < SCHEMA_VERSION => {
+                self.conn
+                    .execute(
+                        "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
+                        params![SCHEMA_VERSION.to_string()],
+                    )
+                    .context("failed to update database schema version")?;
+            }
+            Some(_) => {}
+        }
+        Ok(())
+    }
+
+    /// Add the v2 annotation columns to a database created by v1.
+    fn ensure_annotation_columns(&self) -> Result<()> {
+        let mut statement = self.conn.prepare("PRAGMA table_info(devices)")?;
+        let existing: Vec<String> = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let additions = [
+            ("label", "ALTER TABLE devices ADD COLUMN label TEXT"),
+            ("notes", "ALTER TABLE devices ADD COLUMN notes TEXT"),
+            (
+                "tags",
+                "ALTER TABLE devices ADD COLUMN tags TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "ignored",
+                "ALTER TABLE devices ADD COLUMN ignored INTEGER NOT NULL DEFAULT 0",
+            ),
+        ];
+        for (name, sql) in additions {
+            if !existing.iter().any(|column| column == name) {
+                self.conn
+                    .execute_batch(sql)
+                    .with_context(|| format!("failed to add devices.{name}"))?;
+            }
         }
         Ok(())
     }
@@ -441,8 +567,9 @@ impl Database {
                 true
             };
             transaction.execute(
-                "INSERT INTO devices(last_ip, last_mac, last_hostname, vendor, device_type, os, interface, active, first_seen, last_seen)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                "INSERT INTO devices(last_ip, last_mac, last_hostname, vendor, device_type, os, interface, active,
+                                     first_seen, last_seen, label, notes, tags, ignored)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     device.last_ip.map(|ip| ip.to_string()),
                     mac,
@@ -454,6 +581,10 @@ impl Database {
                     i64::from(active),
                     to_ts(device.first_seen),
                     to_ts(device.last_seen),
+                    device.label,
+                    device.notes,
+                    format_tags(&device.tags),
+                    i64::from(device.ignored),
                 ],
             )?;
             let id = transaction.last_insert_rowid();
@@ -656,6 +787,64 @@ impl Database {
                 |row| row.get(0),
             )
             .optional()?)
+    }
+
+    /// Apply a partial user-annotation update and return the updated device.
+    ///
+    /// An empty label or note clears the field. Tags are normalised to
+    /// lower-case; adding an existing tag is a no-op. A scan merge never
+    /// overwrites these values.
+    pub fn update_annotations(
+        &mut self,
+        device_id: i64,
+        patch: &AnnotationPatch,
+    ) -> Result<Device> {
+        let existing = load_device_with_conn(&self.conn, device_id, true)?
+            .ok_or_else(|| FindaratError::DeviceNotFound(device_id.to_string()))?;
+        let label = patch
+            .label
+            .as_deref()
+            .map(clean_optional)
+            .unwrap_or_else(|| existing.label.clone());
+        let notes = patch
+            .notes
+            .as_deref()
+            .map(clean_optional)
+            .unwrap_or_else(|| existing.notes.clone());
+        let mut tags: std::collections::BTreeSet<String> = if patch.clear_tags {
+            std::collections::BTreeSet::new()
+        } else {
+            existing.tags.iter().cloned().collect()
+        };
+        for tag in &patch.remove_tags {
+            if let Some(tag) = normalise_tag(tag)? {
+                tags.remove(&tag);
+            }
+        }
+        for tag in &patch.add_tags {
+            if let Some(tag) = normalise_tag(tag)? {
+                tags.insert(tag);
+            }
+        }
+        let tags: Vec<String> = tags.into_iter().collect();
+        let ignored = patch.ignored.unwrap_or(existing.ignored);
+
+        let updated = self.conn.execute(
+            "UPDATE devices SET label = ?1, notes = ?2, tags = ?3, ignored = ?4 WHERE id = ?5",
+            params![
+                label,
+                notes,
+                format_tags(&tags),
+                i64::from(ignored),
+                device_id
+            ],
+        )?;
+        if updated == 0 {
+            return Err(FindaratError::DeviceNotFound(device_id.to_string()).into());
+        }
+        load_device_with_conn(&self.conn, device_id, true)?.ok_or_else(|| {
+            FindaratError::Database(format!("device {device_id} disappeared")).into()
+        })
     }
 
     pub fn count_devices(&self) -> Result<usize> {
@@ -1073,11 +1262,21 @@ fn update_existing_device(
         .hostname
         .clone()
         .or_else(|| existing.hostname.clone());
+    // Annotations belong to the user. A merge may fill an empty field from an
+    // imported device, but it never overwrites a local edit.
+    let label = existing.label.clone().or_else(|| observed.label.clone());
+    let notes = existing.notes.clone().or_else(|| observed.notes.clone());
+    let tags = if existing.tags.is_empty() {
+        observed.tags.clone()
+    } else {
+        existing.tags.clone()
+    };
 
     transaction.execute(
         "UPDATE devices SET last_ip = ?1, last_mac = ?2, last_hostname = ?3, vendor = ?4,
-             device_type = ?5, os = ?6, interface = ?7, active = ?8, first_seen = ?9, last_seen = ?10
-         WHERE id = ?11",
+             device_type = ?5, os = ?6, interface = ?7, active = ?8, first_seen = ?9, last_seen = ?10,
+             label = ?11, notes = ?12, tags = ?13, ignored = ?14
+         WHERE id = ?15",
         params![
             last_ip.map(|ip| ip.to_string()),
             last_mac,
@@ -1089,6 +1288,10 @@ fn update_existing_device(
             i64::from(active),
             to_ts(first_seen),
             to_ts(last_seen),
+            label,
+            notes,
+            format_tags(&tags),
+            i64::from(existing.ignored),
             existing.id,
         ],
     )?;
@@ -1098,8 +1301,9 @@ fn update_existing_device(
     }
 
     let device_id = existing.id.unwrap_or_default();
-    let label = last_hostname
+    let label = label
         .clone()
+        .or_else(|| last_hostname.clone())
         .or(last_mac.clone())
         .or_else(|| last_ip.map(|ip| ip.to_string()))
         .unwrap_or_else(|| format!("device {device_id}"));
@@ -1191,7 +1395,8 @@ fn load_device_with_conn(
 ) -> Result<Option<Device>> {
     let row = conn
         .query_row(
-            "SELECT id, last_ip, last_mac, last_hostname, vendor, device_type, os, interface, first_seen, last_seen, active
+            "SELECT id, last_ip, last_mac, last_hostname, vendor, device_type, os, interface, first_seen, last_seen, active,
+                    label, notes, tags, ignored
              FROM devices WHERE id = ?1",
             params![id],
             |row| {
@@ -1207,6 +1412,10 @@ fn load_device_with_conn(
                     row.get::<_, String>(8)?,
                     row.get::<_, String>(9)?,
                     row.get::<_, i64>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, String>(13)?,
+                    row.get::<_, i64>(14)?,
                 ))
             },
         )
@@ -1223,6 +1432,10 @@ fn load_device_with_conn(
         first_seen,
         last_seen,
         active,
+        label,
+        notes,
+        tags,
+        ignored,
     )) = row
     else {
         return Ok(None);
@@ -1233,6 +1446,10 @@ fn load_device_with_conn(
     device.last_ip = parse_optional_ip(last_ip)?;
     device.mac = mac;
     device.hostname = hostname;
+    device.label = label;
+    device.notes = notes;
+    device.tags = parse_tags(&tags);
+    device.ignored = ignored != 0;
     device.vendor = vendor;
     device.device_type = device_type
         .parse::<DeviceType>()
@@ -1587,6 +1804,60 @@ fn parse_optional_ip(value: Option<String>) -> Result<Option<IpAddr>> {
         .transpose()
 }
 
+fn clean_optional(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Normalise a user tag. Returns `Ok(None)` for an empty tag.
+fn normalise_tag(value: &str) -> Result<Option<String>> {
+    let tag = value.trim().trim_start_matches('#').to_ascii_lowercase();
+    if tag.is_empty() {
+        return Ok(None);
+    }
+    if tag.contains(',') || tag.chars().any(char::is_control) {
+        return Err(FindaratError::Validation(format!(
+            "invalid tag {value:?}: tags cannot contain commas or control characters"
+        ))
+        .into());
+    }
+    Ok(Some(
+        tag.chars()
+            .map(|character| {
+                if character.is_whitespace() {
+                    '-'
+                } else {
+                    character
+                }
+            })
+            .collect(),
+    ))
+}
+
+fn parse_tags(value: &str) -> Vec<String> {
+    let mut tags: Vec<String> = value
+        .split(',')
+        .filter_map(|tag| normalise_tag(tag).ok().flatten())
+        .collect();
+    tags.sort();
+    tags.dedup();
+    tags
+}
+
+fn format_tags(tags: &[String]) -> String {
+    let mut normalised: Vec<String> = tags
+        .iter()
+        .filter_map(|tag| normalise_tag(tag).ok().flatten())
+        .collect();
+    normalised.sort();
+    normalised.dedup();
+    normalised.join(",")
+}
+
 fn limit_to_i64(limit: Option<usize>) -> i64 {
     limit
         .and_then(|limit| i64::try_from(limit).ok())
@@ -1594,12 +1865,7 @@ fn limit_to_i64(limit: Option<usize>) -> i64 {
 }
 
 fn device_label(device: &Device) -> String {
-    device
-        .hostname
-        .clone()
-        .or_else(|| device.mac.clone())
-        .or_else(|| device.last_ip.map(|ip| ip.to_string()))
-        .unwrap_or_else(|| "unknown device".to_string())
+    device.display_name()
 }
 
 fn service_key(service: &ServiceObservation) -> String {
@@ -1676,6 +1942,7 @@ pub fn match_summary(found: &HashMap<i64, IdentityMatch>) -> String {
 mod tests {
     use super::*;
     use crate::models::EvidenceKind;
+    use tempfile::tempdir;
 
     fn device(ip: &str, mac: &str, hostname: &str) -> Device {
         let now = Utc::now();
@@ -1696,6 +1963,187 @@ mod tests {
         drop(db);
         let db = Database::open_in_memory().unwrap();
         assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migrates_v1_database_and_preserves_devices() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("v1.db");
+        let mut db = Database::open(&path).unwrap();
+        let outcome = db
+            .upsert_device(
+                &device("192.168.1.10", "AA:BB:CC:DD:EE:01", "alpha"),
+                None,
+                false,
+            )
+            .unwrap();
+        drop(db);
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            for column in ["label", "notes", "tags", "ignored"] {
+                conn.execute_batch(&format!("ALTER TABLE devices DROP COLUMN {column};"))
+                    .unwrap();
+            }
+            conn.execute(
+                "UPDATE schema_meta SET value = '1' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 2);
+        let loaded = db.get_device(outcome.device_id).unwrap().unwrap();
+        assert_eq!(loaded.hostname.as_deref(), Some("alpha"));
+        assert!(loaded.label.is_none());
+        assert!(loaded.notes.is_none());
+        assert!(loaded.tags.is_empty());
+        assert!(!loaded.ignored);
+    }
+
+    #[test]
+    fn annotations_round_trip_and_normalise_tags() {
+        let mut db = Database::open_in_memory().unwrap();
+        let outcome = db
+            .upsert_device(
+                &device("192.168.1.10", "AA:BB:CC:DD:EE:01", "alpha"),
+                None,
+                false,
+            )
+            .unwrap();
+        let updated = db
+            .update_annotations(
+                outcome.device_id,
+                &AnnotationPatch {
+                    label: Some("Office printer".to_string()),
+                    notes: Some("second floor".to_string()),
+                    add_tags: vec!["Office".to_string(), "Printer".to_string()],
+                    ignored: Some(true),
+                    ..AnnotationPatch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.label.as_deref(), Some("Office printer"));
+        assert_eq!(updated.display_name(), "Office printer");
+        assert_eq!(
+            updated.tags,
+            vec!["office".to_string(), "printer".to_string()]
+        );
+        assert!(updated.ignored);
+
+        let updated = db
+            .update_annotations(
+                outcome.device_id,
+                &AnnotationPatch {
+                    remove_tags: vec!["OFFICE".to_string()],
+                    add_tags: vec!["network".to_string()],
+                    ..AnnotationPatch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            updated.tags,
+            vec!["network".to_string(), "printer".to_string()]
+        );
+
+        let updated = db
+            .update_annotations(
+                outcome.device_id,
+                &AnnotationPatch {
+                    clear_tags: true,
+                    add_tags: vec!["replacement".to_string()],
+                    ..AnnotationPatch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.tags, vec!["replacement".to_string()]);
+    }
+
+    #[test]
+    fn scan_merges_preserve_local_annotations() {
+        let mut db = Database::open_in_memory().unwrap();
+        let outcome = db
+            .upsert_device(
+                &device("192.168.1.10", "AA:BB:CC:DD:EE:01", "alpha"),
+                None,
+                false,
+            )
+            .unwrap();
+        db.update_annotations(
+            outcome.device_id,
+            &AnnotationPatch {
+                label: Some("Kitchen".to_string()),
+                notes: Some("keep me".to_string()),
+                add_tags: vec!["local".to_string()],
+                ignored: Some(true),
+                ..AnnotationPatch::default()
+            },
+        )
+        .unwrap();
+
+        let mut rescanned = device("192.168.1.10", "AA:BB:CC:DD:EE:01", "alpha-renamed");
+        rescanned.label = Some("scanner label".to_string());
+        rescanned.notes = Some("scanner notes".to_string());
+        rescanned.tags = vec!["scanner".to_string()];
+        rescanned.ignored = false;
+        rescanned.last_seen += chrono::Duration::seconds(10);
+        db.upsert_device(&rescanned, None, false).unwrap();
+
+        let loaded = db.get_device(outcome.device_id).unwrap().unwrap();
+        assert_eq!(loaded.hostname.as_deref(), Some("alpha-renamed"));
+        assert_eq!(loaded.label.as_deref(), Some("Kitchen"));
+        assert_eq!(loaded.notes.as_deref(), Some("keep me"));
+        assert_eq!(loaded.tags, vec!["local".to_string()]);
+        assert!(loaded.ignored);
+    }
+
+    #[test]
+    fn open_copy_rejects_a_foreign_sqlite_database() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("foreign.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE unrelated (value TEXT);")
+                .unwrap();
+        }
+        let Err(error) = Database::open_copy(&path) else {
+            panic!("expected open_copy to reject a non-findarat database");
+        };
+        assert!(error.to_string().contains("not a findarat database"));
+    }
+
+    #[test]
+    fn open_copy_migrates_without_touching_the_source() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("source.db");
+        let mut db = Database::open(&path).unwrap();
+        db.upsert_device(
+            &device("192.168.1.10", "AA:BB:CC:DD:EE:01", "alpha"),
+            None,
+            false,
+        )
+        .unwrap();
+        drop(db);
+        {
+            let conn = Connection::open(&path).unwrap();
+            for column in ["label", "notes", "tags", "ignored"] {
+                conn.execute_batch(&format!("ALTER TABLE devices DROP COLUMN {column};"))
+                    .unwrap();
+            }
+            conn.execute(
+                "UPDATE schema_meta SET value = '1' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let copy = Database::open_copy(&path).unwrap();
+        assert_eq!(copy.schema_version().unwrap(), 2);
+        assert_eq!(copy.count_devices().unwrap(), 1);
+
+        let source = Database::open_read_only(&path).unwrap();
+        assert_eq!(source.schema_version().unwrap(), 1);
     }
 
     #[test]

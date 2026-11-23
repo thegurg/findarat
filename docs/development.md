@@ -52,8 +52,8 @@ The full suite currently consists of library unit tests and end-to-end CLI
 tests. A passing run looks like:
 
 ```text
-running 145 tests ... test result: ok
-running 12 tests ... test result: ok
+running 170 tests ... test result: ok
+running 15 tests ... test result: ok
 ```
 
 ## Test layout
@@ -72,10 +72,12 @@ Coverage includes:
 - Evidence and confidence serialization.
 - Change detection rules.
 - SQLite schema creation, upserts, identity merges, duplicates, conflicts,
-  history, and migrations.
-- JSON/CSV/SQLite export and JSON/SQLite import, including dry-run, merge,
-  skip, schema rejection, and bare-array imports.
-- TUI state transitions and key handling without a real terminal.
+  history, annotations, and v1-to-v2 migrations.
+- Explain output, per-device timelines, and local fingerprint rules.
+- JSON/CSV/SQLite export and JSON/SQLite/Nmap/arp-scan import, including
+  dry-run, merge, skip, schema rejection, and bare-array imports.
+- TUI state transitions, annotation editing, ignored filtering, and key
+  handling without a real terminal.
 
 Prefer pure functions for rules so they can be tested without sockets or a
 database. Network providers should keep parsing and merge logic separate from
@@ -93,6 +95,7 @@ socket I/O.
 - Config initialization and overwrite refusal.
 - Import dry-run not writing.
 - Import, list, export, and re-import round trips.
+- Annotation commands, device filters, explain, and timeline JSON.
 
 Add an integration test when a change affects command behavior, exit codes, or
 file formats. Use `TempDir` and explicit paths; never depend on the developer's

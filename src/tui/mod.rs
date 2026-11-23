@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 
 use crate::app::{self, ScanEvent, ScanRequest};
 use crate::config::Config;
-use crate::inventory::Database;
+use crate::inventory::{AnnotationPatch, Database};
 use crate::io::{self, ExportFormat, ImportFormat, ImportOptions};
 use crate::models::{Change, Device, ProviderReport, ScanSession};
 
@@ -129,6 +129,29 @@ impl ScanState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnnotationField {
+    Label,
+    Notes,
+    Tags,
+}
+
+impl AnnotationField {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Label => "label",
+            Self::Notes => "notes",
+            Self::Tags => "tags (comma separated)",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AnnotationEditor {
+    field: AnnotationField,
+    buffer: String,
+}
+
 struct TuiApp {
     config: Config,
     database: Database,
@@ -157,6 +180,8 @@ struct TuiApp {
     settings_scroll: u16,
     help_scroll: u16,
     settings_text: String,
+    hide_ignored: bool,
+    annotation_editor: Option<AnnotationEditor>,
     should_quit: bool,
 }
 
@@ -210,6 +235,8 @@ impl TuiApp {
             settings_scroll: 0,
             help_scroll: 0,
             settings_text,
+            hide_ignored: false,
+            annotation_editor: None,
             should_quit: false,
         };
         app.refresh_all()?;
@@ -275,7 +302,10 @@ impl TuiApp {
             .devices
             .iter()
             .enumerate()
-            .filter(|(_, device)| needle.is_empty() || device_matches(device, &needle))
+            .filter(|(_, device)| {
+                (!self.hide_ignored || !device.ignored)
+                    && (needle.is_empty() || device_matches(device, &needle))
+            })
             .map(|(index, _)| index)
             .collect();
         match self.sort {
@@ -349,6 +379,10 @@ impl TuiApp {
         }
         if self.path_input_mode {
             self.handle_path_key(key);
+            return;
+        }
+        if self.annotation_editor.is_some() {
+            self.handle_annotation_key(key);
             return;
         }
 
@@ -452,6 +486,14 @@ impl TuiApp {
                 self.status = format!("sorted by {}", self.sort.label());
                 self.clamp_selection();
             }
+            KeyCode::Char('i') => {
+                self.hide_ignored = !self.hide_ignored;
+                self.status = format!(
+                    "ignored devices {}",
+                    if self.hide_ignored { "hidden" } else { "shown" }
+                );
+                self.clamp_selection();
+            }
             KeyCode::Char('r') => self.reload(),
             _ => {}
         }
@@ -464,7 +506,129 @@ impl TuiApp {
             KeyCode::Down => self.details_scroll = self.details_scroll.saturating_add(1),
             KeyCode::PageUp => self.details_scroll = self.details_scroll.saturating_sub(10),
             KeyCode::PageDown => self.details_scroll = self.details_scroll.saturating_add(10),
+            KeyCode::Char('l') => self.open_annotation_editor(AnnotationField::Label),
+            KeyCode::Char('n') => self.open_annotation_editor(AnnotationField::Notes),
+            KeyCode::Char('t') => self.open_annotation_editor(AnnotationField::Tags),
+            KeyCode::Char('i') => self.toggle_ignored(),
             _ => {}
+        }
+    }
+
+    fn handle_annotation_key(&mut self, key: KeyEvent) {
+        let Some(editor) = self.annotation_editor.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.annotation_editor = None;
+                self.status = "annotation edit cancelled".to_string();
+            }
+            KeyCode::Enter => {
+                if let Some(editor) = self.annotation_editor.take() {
+                    self.apply_annotation(editor);
+                }
+            }
+            KeyCode::Backspace => {
+                editor.buffer.pop();
+            }
+            KeyCode::Char(character) => editor.buffer.push(character),
+            _ => {}
+        }
+    }
+
+    fn open_annotation_editor(&mut self, field: AnnotationField) {
+        let Some(device) = self.selected_device() else {
+            self.status = "select a device first".to_string();
+            return;
+        };
+        let buffer = match field {
+            AnnotationField::Label => device.label.clone().unwrap_or_default(),
+            AnnotationField::Notes => device.notes.clone().unwrap_or_default(),
+            AnnotationField::Tags => device.tags.join(", "),
+        };
+        self.annotation_editor = Some(AnnotationEditor { field, buffer });
+        self.status = format!(
+            "edit {}; Enter saves, Esc cancels (empty clears)",
+            field.label()
+        );
+    }
+
+    fn apply_annotation(&mut self, editor: AnnotationEditor) {
+        let Some(device) = self.selected_device() else {
+            self.status = "select a device first".to_string();
+            return;
+        };
+        let Some(device_id) = device.id else {
+            self.status = "device has no id".to_string();
+            return;
+        };
+        let value = editor.buffer.trim().to_string();
+        let patch = match editor.field {
+            AnnotationField::Label => AnnotationPatch {
+                label: Some(value),
+                ..AnnotationPatch::default()
+            },
+            AnnotationField::Notes => AnnotationPatch {
+                notes: Some(value),
+                ..AnnotationPatch::default()
+            },
+            AnnotationField::Tags => {
+                let tags = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|tag| !tag.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                AnnotationPatch {
+                    add_tags: tags,
+                    clear_tags: true,
+                    ..AnnotationPatch::default()
+                }
+            }
+        };
+        match self.database.update_annotations(device_id, &patch) {
+            Ok(updated) => {
+                self.status = format!(
+                    "saved {} for {}",
+                    editor.field.label(),
+                    updated.display_name()
+                );
+                self.reload_silently();
+            }
+            Err(error) => self.status = format!("annotation failed: {error:#}"),
+        }
+    }
+
+    fn toggle_ignored(&mut self) {
+        let Some(device) = self.selected_device() else {
+            self.status = "select a device first".to_string();
+            return;
+        };
+        let Some(device_id) = device.id else {
+            self.status = "device has no id".to_string();
+            return;
+        };
+        let ignored = !device.ignored;
+        let patch = AnnotationPatch {
+            ignored: Some(ignored),
+            ..AnnotationPatch::default()
+        };
+        match self.database.update_annotations(device_id, &patch) {
+            Ok(updated) => {
+                self.status = format!(
+                    "{} is now {}",
+                    updated.display_name(),
+                    if ignored { "ignored" } else { "not ignored" }
+                );
+                self.reload_silently();
+            }
+            Err(error) => self.status = format!("annotation failed: {error:#}"),
+        }
+    }
+
+    fn reload_silently(&mut self) {
+        if let Err(error) = self.refresh_all() {
+            self.status = format!("reload failed: {error:#}");
         }
     }
 
@@ -724,9 +888,11 @@ impl TuiApp {
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
         let hints = match self.screen {
             Screen::Devices => {
-                "↑/↓ move · Enter details · / search · s sort · r refresh · Tab screens · q quit"
+                "↑/↓ move · Enter details · / search · s sort · i hide ignored · r refresh · Tab screens · q quit"
             }
-            Screen::Details => "↑/↓ scroll · Esc back · Tab screens · q quit",
+            Screen::Details => {
+                "↑/↓ scroll · l label · n notes · t tags · i ignore · Esc back · Tab screens · q quit"
+            }
             Screen::Scan => "Enter start scan · r refresh · Tab screens · q quit",
             Screen::History => "↑/↓ scroll · r refresh · Tab screens · q quit",
             Screen::ImportExport => {
@@ -736,7 +902,9 @@ impl TuiApp {
             Screen::Help => "↑/↓ scroll · Esc dashboard · Tab screens · q quit",
             Screen::Dashboard => "r refresh · Tab screens · q quit · ? help",
         };
-        let text = if self.search_mode {
+        let text = if let Some(editor) = &self.annotation_editor {
+            format!("{}: {}▌", editor.field.label(), editor.buffer)
+        } else if self.search_mode {
             format!("search: {}▌", self.search)
         } else if self.path_input_mode {
             format!("path: {}▌", self.io_path)
@@ -840,11 +1008,22 @@ impl TuiApp {
                     Cell::from(device.vendor.clone().unwrap_or_else(|| "—".to_string())),
                     Cell::from(app::port_list(&device.ports)),
                     Cell::from(if device.active { "yes" } else { "no" }.to_string()),
+                    Cell::from(if device.tags.is_empty() {
+                        "—".to_string()
+                    } else {
+                        device.tags.join(", ")
+                    }),
+                    Cell::from(if device.ignored { "yes" } else { "no" }.to_string()),
                 ])
                 .style(style)
             })
             .collect();
-        let title = if self.search.is_empty() {
+        let hidden = if self.hide_ignored {
+            self.devices.iter().filter(|device| device.ignored).count()
+        } else {
+            0
+        };
+        let mut title = if self.search.is_empty() {
             format!(
                 "Devices ({} shown, sorted by {})",
                 indices.len(),
@@ -858,6 +1037,9 @@ impl TuiApp {
                 self.sort.label()
             )
         };
+        if hidden > 0 {
+            title.push_str(&format!(" · {hidden} ignored hidden"));
+        }
         let table = Table::new(
             rows,
             [
@@ -869,11 +1051,13 @@ impl TuiApp {
                 Constraint::Length(18),
                 Constraint::Length(16),
                 Constraint::Length(6),
+                Constraint::Length(16),
+                Constraint::Length(7),
             ],
         )
         .header(
             Row::new(vec![
-                "ID", "Name", "IP", "MAC", "Type", "Vendor", "Ports", "Active",
+                "ID", "Name", "IP", "MAC", "Type", "Vendor", "Ports", "Active", "Tags", "Ignored",
             ])
             .style(self.accent_style()),
         )
@@ -921,6 +1105,17 @@ impl TuiApp {
                 device.first_seen.format("%Y-%m-%d %H:%M"),
                 device.last_seen.format("%Y-%m-%d %H:%M")
             )),
+            Line::from(format!(
+                "Label: {}   Tags: {}   Ignored: {}",
+                device.label.as_deref().unwrap_or("—"),
+                if device.tags.is_empty() {
+                    "—".to_string()
+                } else {
+                    device.tags.join(", ")
+                },
+                if device.ignored { "yes" } else { "no" }
+            )),
+            Line::from(format!("Notes: {}", device.notes.as_deref().unwrap_or("—"))),
             Line::from(""),
             Line::from(Span::styled(
                 "Identifiers",
@@ -1148,7 +1343,7 @@ impl TuiApp {
             )),
             Line::from(""),
             Line::from("e  export using the path extension (.json, .csv, .db)"),
-            Line::from("i  import the path (JSON export or findarat SQLite database)"),
+            Line::from("i  import the path (JSON, findarat SQLite, Nmap XML, or arp-scan text)"),
             Line::from("p  edit the path"),
             Line::from("x  toggle import dry-run"),
             Line::from(""),
@@ -1186,8 +1381,10 @@ impl TuiApp {
             Line::from("q or Ctrl+C       quit"),
             Line::from("?                 open this help"),
             Line::from(""),
-            Line::from("Devices: ↑/↓ move, Enter details, / search, s sort, r refresh"),
-            Line::from("Details: ↑/↓ scroll, Esc back"),
+            Line::from(
+                "Devices: ↑/↓ move, Enter details, / search, s sort, i hide ignored, r refresh",
+            ),
+            Line::from("Details: ↑/↓ scroll, l label, n notes, t tags, i ignore, Esc back"),
             Line::from("Scan:    Enter or s start a scan"),
             Line::from("History: ↑/↓ scroll, r refresh"),
             Line::from("I/O:     e export, i import, p edit path, x dry-run"),
@@ -1381,5 +1578,75 @@ mod tests {
         assert_eq!(app.screen, Screen::Details);
         app.handle_key(key(KeyCode::Char('8')));
         assert_eq!(app.screen, Screen::Help);
+    }
+
+    #[test]
+    fn ignored_devices_can_be_hidden() {
+        let mut app = app_with_devices();
+        app.screen = Screen::Devices;
+        let id = app.devices[0].id.unwrap();
+        app.database
+            .update_annotations(
+                id,
+                &AnnotationPatch {
+                    ignored: Some(true),
+                    ..AnnotationPatch::default()
+                },
+            )
+            .unwrap();
+        app.refresh_all().unwrap();
+        assert_eq!(app.filtered_indices().len(), 2);
+        app.handle_key(key(KeyCode::Char('i')));
+        assert!(app.hide_ignored);
+        assert_eq!(app.filtered_indices().len(), 1);
+        app.handle_key(key(KeyCode::Char('i')));
+        assert!(!app.hide_ignored);
+        assert_eq!(app.filtered_indices().len(), 2);
+    }
+
+    #[test]
+    fn annotation_editor_updates_label_and_tags() {
+        let mut app = app_with_devices();
+        app.screen = Screen::Devices;
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.screen, Screen::Details);
+
+        app.handle_key(key(KeyCode::Char('l')));
+        assert!(app.annotation_editor.is_some());
+        for character in "office printer".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.annotation_editor.is_none());
+        assert_eq!(
+            app.selected_device().unwrap().label.as_deref(),
+            Some("office printer")
+        );
+
+        app.handle_key(key(KeyCode::Char('t')));
+        for character in "Office, Printer".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.selected_device().unwrap().tags,
+            vec!["office".to_string(), "printer".to_string()]
+        );
+
+        app.handle_key(key(KeyCode::Char('i')));
+        assert!(app.selected_device().unwrap().ignored);
+    }
+
+    #[test]
+    fn annotation_editor_cancels_without_writing() {
+        let mut app = app_with_devices();
+        app.screen = Screen::Details;
+        app.handle_key(key(KeyCode::Char('n')));
+        for character in "should not stick".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.annotation_editor.is_none());
+        assert!(app.selected_device().unwrap().notes.is_none());
     }
 }

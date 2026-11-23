@@ -328,6 +328,20 @@ pub struct Device {
     pub vendor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
+    /// User-assigned name. Unlike `hostname`, this is authoritative and is not
+    /// overwritten by discovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Free-form user notes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    /// User tags (for example `iot`, `trusted`, `guest`). Stored lower-case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Devices marked ignored stay in history but are hidden from default
+    /// listings and future alerting.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ignored: bool,
     #[serde(default)]
     pub device_type: DeviceType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -356,6 +370,10 @@ fn default_true() -> bool {
     true
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 impl Device {
     pub fn new(first_seen: DateTime<Utc>, last_seen: DateTime<Utc>) -> Self {
         Self {
@@ -364,6 +382,10 @@ impl Device {
             mac: None,
             vendor: None,
             hostname: None,
+            label: None,
+            notes: None,
+            tags: Vec::new(),
+            ignored: false,
             device_type: DeviceType::Unknown,
             os: None,
             interface: None,
@@ -379,11 +401,27 @@ impl Device {
     }
 
     pub fn display_name(&self) -> String {
-        self.hostname
+        self.label
             .clone()
+            .or_else(|| self.hostname.clone())
             .or_else(|| self.mac.clone())
             .or_else(|| self.last_ip.map(|ip| ip.to_string()))
             .unwrap_or_else(|| "unknown device".to_string())
+    }
+
+    /// True when the device carries `tag` (case-insensitive, whitespace
+    /// normalised the same way as stored tags).
+    pub fn has_tag(&self, tag: &str) -> bool {
+        let tag = tag
+            .trim()
+            .trim_start_matches('#')
+            .to_ascii_lowercase()
+            .replace(char::is_whitespace, "-");
+        !tag.is_empty()
+            && self
+                .tags
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(&tag))
     }
 
     pub fn open_port_summary(&self) -> String {
@@ -509,5 +547,22 @@ mod tests {
         device.add_evidence(evidence.clone());
         device.add_evidence(evidence);
         assert_eq!(device.evidence.len(), 1);
+    }
+
+    #[test]
+    fn annotation_display_name_and_tags_are_user_friendly() {
+        let now = Utc::now();
+        let mut device = Device::new(now, now);
+        device.hostname = Some("alpha".to_string());
+        assert_eq!(device.display_name(), "alpha");
+        device.label = Some("Office printer".to_string());
+        assert_eq!(device.display_name(), "Office printer");
+
+        device.tags = vec!["office".to_string(), "my-tag".to_string()];
+        assert!(device.has_tag("OFFICE"));
+        assert!(device.has_tag("#my tag"));
+        assert!(device.has_tag(" my-tag "));
+        assert!(!device.has_tag("guest"));
+        assert!(!device.has_tag(""));
     }
 }

@@ -51,6 +51,7 @@ pub struct Config {
     pub scanner: ScannerConfig,
     pub storage: StorageConfig,
     pub tui: TuiConfig,
+    pub fingerprint: FingerprintConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +155,22 @@ impl Default for TuiConfig {
         Self {
             show_colors: true,
             refresh_interval_ms: 1000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FingerprintConfig {
+    /// TOML file with local fingerprint rules. Relative paths resolve against
+    /// the configuration file. An empty string disables local rules.
+    pub rules_file: String,
+}
+
+impl Default for FingerprintConfig {
+    fn default() -> Self {
+        Self {
+            rules_file: "rules.toml".to_string(),
         }
     }
 }
@@ -263,6 +280,14 @@ mod tests {
         assert_eq!(config.scanner.timeout_ms, 500);
         assert_eq!(config.scanner.concurrency, 100);
         assert!(config.discovery.arp);
+        assert_eq!(config.fingerprint.rules_file, "rules.toml");
+    }
+
+    #[test]
+    fn parses_fingerprint_rules_file() {
+        let config: Config =
+            toml::from_str("[fingerprint]\nrules_file = \"custom.toml\"\n").unwrap();
+        assert_eq!(config.fingerprint.rules_file, "custom.toml");
     }
 
     #[test]

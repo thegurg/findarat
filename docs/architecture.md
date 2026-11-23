@@ -34,9 +34,9 @@ src/
   discovery/           ARP, mDNS, SSDP, NetBIOS providers and result merging
     dns.rs             minimal DNS wire parser/builder used by mDNS/NetBIOS
   scanner/             port-spec parsing and bounded TCP connect scanning
-  fingerprint/         OUI, hostname, device-type, OS, and service heuristics
-  inventory/           identity matching, SQLite persistence, history/changes
-  io/                  JSON/CSV/SQLite export and JSON/SQLite import
+  fingerprint/         OUI, hostname, device-type, OS, service heuristics, local rules
+  inventory/           identity matching, SQLite persistence, history, explain, timeline
+  io/                  JSON/CSV/SQLite export; JSON/SQLite/Nmap/arp-scan import
   models/              Device, evidence, observations, sessions, changes
   error.rs             stable error categories and exit codes
 ```
@@ -129,8 +129,14 @@ evidence, ports, services, and changes in one transaction. The device row is a
 last-known snapshot; the child tables are the historical record.
 
 The schema uses `schema_meta.schema_version` for compatibility checks. Opening
-a database from a newer build fails with an upgrade message. See
+a database from a newer build fails with an upgrade message. Opening a v1
+database adds the annotation columns and records version 2 in place. See
 [data-model.md](data-model.md).
+
+User annotations (`label`, `notes`, `tags`, `ignored`) are merged separately
+from observed fields: a scan never overwrites them, while an import may fill a
+field that is empty locally. `inventory::explain` and `inventory::timeline`
+read the stored evidence and history without inventing new conclusions.
 
 ## CLI
 

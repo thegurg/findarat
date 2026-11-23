@@ -17,4 +17,4 @@ pub mod tui;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Export/import schema version. Bump only for incompatible changes.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;

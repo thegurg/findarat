@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::app::{self, ScanRequest};
 use crate::config::{self, LoadedConfig, OutputFormat};
 use crate::error::FindaratError;
-use crate::inventory::Database;
+use crate::inventory::{AnnotationPatch, Database};
 use crate::io::{self, ExportFormat, ImportFormat, ImportOptions, ImportReport};
 use crate::models::{ChangeKind, Device, ScanSession};
 use crate::network::interface::list_interfaces;
@@ -69,13 +69,22 @@ pub enum Command {
         /// Device id, IP address, MAC address, or hostname.
         target: String,
     },
+    /// Set a user name, notes, tags, or the ignored flag on a device.
+    Annotate(AnnotateArgs),
+    /// Explain the evidence behind a device's inferred properties.
+    Explain {
+        /// Device id, IP address, MAC address, or hostname.
+        target: String,
+    },
+    /// Show a device's observations and changes in chronological order.
+    Timeline(TimelineArgs),
     /// List scan sessions.
     History(HistoryArgs),
     /// List detected changes.
     Changes(ChangesArgs),
     /// Export the inventory to JSON, CSV, or SQLite.
     Export(ExportArgs),
-    /// Import devices and history from JSON or SQLite.
+    /// Import devices and history from JSON, SQLite, Nmap XML, or arp-scan output.
     Import(ImportArgs),
     /// List network interfaces.
     Interfaces,
@@ -152,11 +161,71 @@ pub struct DevicesArgs {
     #[arg(long, value_name = "TEXT")]
     pub search: Option<String>,
 
+    /// Exclude devices marked ignored.
+    #[arg(long)]
+    pub exclude_ignored: bool,
+
+    /// Only show devices carrying this tag.
+    #[arg(long, value_name = "TAG")]
+    pub tag: Option<String>,
+
     /// Sort by last_seen, first_seen, ip, name, type, vendor, or id.
     #[arg(long, default_value = "last_seen", value_name = "FIELD")]
     pub sort: String,
 
     /// Maximum number of rows.
+    #[arg(long, value_name = "N")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+pub struct AnnotateArgs {
+    /// Device id, IP address, MAC address, or hostname.
+    pub target: String,
+
+    /// Set the user-assigned display name.
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+
+    /// Remove the user-assigned display name.
+    #[arg(long)]
+    pub clear_name: bool,
+
+    /// Set free-form notes.
+    #[arg(long, value_name = "TEXT")]
+    pub notes: Option<String>,
+
+    /// Remove notes.
+    #[arg(long)]
+    pub clear_notes: bool,
+
+    /// Add a tag (repeatable).
+    #[arg(long = "tag", value_name = "TAG")]
+    pub tags: Vec<String>,
+
+    /// Remove a tag (repeatable).
+    #[arg(long = "untag", value_name = "TAG")]
+    pub untag: Vec<String>,
+
+    /// Mark the device ignored (excluded by --exclude-ignored and future alerts).
+    #[arg(long)]
+    pub ignore: bool,
+
+    /// Remove the ignored flag.
+    #[arg(long)]
+    pub unignore: bool,
+
+    /// Clear the name, notes, tags, and ignored flag.
+    #[arg(long)]
+    pub clear: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct TimelineArgs {
+    /// Device id, IP address, MAC address, or hostname.
+    pub target: String,
+
+    /// Maximum number of events to show.
     #[arg(long, value_name = "N")]
     pub limit: Option<usize>,
 }
@@ -197,10 +266,10 @@ pub struct ExportArgs {
 
 #[derive(Debug, Args)]
 pub struct ImportArgs {
-    /// Source file (JSON export or findarat SQLite database).
+    /// Source file (JSON export, findarat SQLite database, Nmap XML, or arp-scan text).
     pub path: PathBuf,
 
-    /// json, sqlite, or auto (infer from the extension).
+    /// json, sqlite, nmap, arp-scan, or auto (infer from the extension).
     #[arg(long, default_value = "auto", value_name = "FORMAT")]
     pub import_format: String,
 
@@ -252,6 +321,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Scan(args) => run_scan(args, &loaded, format).await,
         Command::Devices(args) => run_devices(args, &loaded, format),
         Command::Device { target } => run_device(&target, &loaded, format),
+        Command::Annotate(args) => run_annotate(args, &loaded, format),
+        Command::Explain { target } => run_explain(&target, &loaded, format),
+        Command::Timeline(args) => run_timeline(args, &loaded, format),
         Command::History(args) => run_history(args, &loaded, format),
         Command::Changes(args) => run_changes(args, &loaded, format),
         Command::Export(args) => run_export(args, &loaded, format),
@@ -293,7 +365,10 @@ fn open_database_for_import(loaded: &LoadedConfig, dry_run: bool) -> Result<Data
     }
     let path = loaded.database_path();
     if path.exists() {
-        Database::open_read_only(path).with_context(|| {
+        // Read a migrated in-memory snapshot. This keeps the destination
+        // untouched while still supporting inventories created by older
+        // schema versions.
+        Database::open_copy(path).with_context(|| {
             format!(
                 "failed to open inventory {} read-only for dry run",
                 path.display()
@@ -451,6 +526,12 @@ fn run_devices(args: DevicesArgs, loaded: &LoadedConfig, format: OutputFormat) -
     if args.active {
         devices.retain(|device| device.active);
     }
+    if args.exclude_ignored {
+        devices.retain(|device| !device.ignored);
+    }
+    if let Some(tag) = args.tag.as_deref() {
+        devices.retain(|device| device.has_tag(tag));
+    }
     if let Some(search) = args.search.as_deref() {
         let needle = search.to_ascii_lowercase();
         devices.retain(|device| device_matches(device, &needle));
@@ -482,6 +563,12 @@ fn run_devices(args: DevicesArgs, loaded: &LoadedConfig, format: OutputFormat) -
                         app::port_list(&device.ports),
                         device.last_seen.format("%Y-%m-%d %H:%M").to_string(),
                         if device.active { "yes" } else { "no" }.to_string(),
+                        if device.tags.is_empty() {
+                            "—".to_string()
+                        } else {
+                            device.tags.join(", ")
+                        },
+                        if device.ignored { "yes" } else { "no" }.to_string(),
                     ]
                 })
                 .collect();
@@ -496,6 +583,8 @@ fn run_devices(args: DevicesArgs, loaded: &LoadedConfig, format: OutputFormat) -
                     "Open ports",
                     "Last seen",
                     "Active",
+                    "Tags",
+                    "Ignored",
                 ],
                 rows,
             );
@@ -517,6 +606,279 @@ fn run_device(target: &str, loaded: &LoadedConfig, format: OutputFormat) -> Resu
     Ok(())
 }
 
+fn run_annotate(args: AnnotateArgs, loaded: &LoadedConfig, format: OutputFormat) -> Result<()> {
+    let mut database = open_database(loaded)?;
+    let device = database
+        .find_device(&args.target)?
+        .ok_or_else(|| FindaratError::DeviceNotFound(args.target.clone()))?;
+    let device_id = device
+        .id
+        .ok_or_else(|| FindaratError::Database("device has no id".into()))?;
+
+    let other_flags = args.name.is_some()
+        || args.clear_name
+        || args.notes.is_some()
+        || args.clear_notes
+        || !args.tags.is_empty()
+        || !args.untag.is_empty()
+        || args.ignore
+        || args.unignore;
+    if args.clear && other_flags {
+        return Err(FindaratError::Validation(
+            "--clear cannot be combined with other annotation flags".into(),
+        )
+        .into());
+    }
+    if args.name.is_some() && args.clear_name {
+        return Err(FindaratError::Validation("--name conflicts with --clear-name".into()).into());
+    }
+    if args.notes.is_some() && args.clear_notes {
+        return Err(
+            FindaratError::Validation("--notes conflicts with --clear-notes".into()).into(),
+        );
+    }
+    if args.ignore && args.unignore {
+        return Err(FindaratError::Validation("--ignore conflicts with --unignore".into()).into());
+    }
+
+    let patch = if args.clear {
+        AnnotationPatch {
+            label: Some(String::new()),
+            notes: Some(String::new()),
+            clear_tags: true,
+            ignored: Some(false),
+            ..AnnotationPatch::default()
+        }
+    } else {
+        AnnotationPatch {
+            label: if args.clear_name {
+                Some(String::new())
+            } else {
+                args.name
+            },
+            notes: if args.clear_notes {
+                Some(String::new())
+            } else {
+                args.notes
+            },
+            add_tags: args.tags,
+            remove_tags: args.untag,
+            clear_tags: false,
+            ignored: if args.ignore {
+                Some(true)
+            } else if args.unignore {
+                Some(false)
+            } else {
+                None
+            },
+        }
+    };
+    if patch.is_empty() {
+        return Err(FindaratError::Validation(
+            "nothing to update; pass --name, --notes, --tag, --ignore, or --clear".into(),
+        )
+        .into());
+    }
+
+    let updated = database.update_annotations(device_id, &patch)?;
+    match format {
+        OutputFormat::Json => print_json(&updated)?,
+        OutputFormat::Table => {
+            println!("updated {} (id {device_id})", updated.display_name());
+            println!("label: {}", updated.label.as_deref().unwrap_or("—"));
+            println!("notes: {}", updated.notes.as_deref().unwrap_or("—"));
+            println!(
+                "tags: {}",
+                if updated.tags.is_empty() {
+                    "—".to_string()
+                } else {
+                    updated.tags.join(", ")
+                }
+            );
+            println!("ignored: {}", updated.ignored);
+        }
+    }
+    Ok(())
+}
+
+fn run_explain(target: &str, loaded: &LoadedConfig, format: OutputFormat) -> Result<()> {
+    let database = open_database(loaded)?;
+    let device = database
+        .find_device(target)?
+        .ok_or_else(|| FindaratError::DeviceNotFound(target.to_string()))?;
+    let explanation = crate::inventory::explain(&device);
+    match format {
+        OutputFormat::Json => print_json(&explanation)?,
+        OutputFormat::Table => print_explanation(&explanation),
+    }
+    Ok(())
+}
+
+fn print_explanation(explanation: &crate::inventory::DeviceExplanation) {
+    println!("{}", explanation.name);
+    println!(
+        "id: {}   ip: {}   mac: {}",
+        explanation
+            .device_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        explanation.ip.as_deref().unwrap_or("unknown"),
+        explanation.mac.as_deref().unwrap_or("unknown")
+    );
+    println!(
+        "hostname: {}   label: {}   ignored: {}",
+        explanation.hostname.as_deref().unwrap_or("—"),
+        explanation.label.as_deref().unwrap_or("—"),
+        explanation.ignored
+    );
+    println!(
+        "tags: {}",
+        if explanation.tags.is_empty() {
+            "—".to_string()
+        } else {
+            explanation.tags.join(", ")
+        }
+    );
+    println!(
+        "first seen: {}   last seen: {}   active: {}",
+        explanation.first_seen.format("%Y-%m-%d %H:%M"),
+        explanation.last_seen.format("%Y-%m-%d %H:%M"),
+        explanation.active
+    );
+
+    if !explanation.identity.is_empty() {
+        println!();
+        println!("identity:");
+        let rows = explanation
+            .identity
+            .iter()
+            .map(|identity| {
+                vec![
+                    identity.kind.clone(),
+                    identity.value.clone(),
+                    identity.confidence.to_string(),
+                    identity.first_seen.format("%Y-%m-%d %H:%M").to_string(),
+                    identity.last_seen.format("%Y-%m-%d %H:%M").to_string(),
+                ]
+            })
+            .collect();
+        print_table(
+            &["Kind", "Value", "Confidence", "First seen", "Last seen"],
+            rows,
+        );
+    }
+
+    if !explanation.properties.is_empty() {
+        println!();
+        println!("properties:");
+        let rows = explanation
+            .properties
+            .iter()
+            .map(|property| {
+                vec![
+                    property.property.clone(),
+                    property
+                        .selected_value
+                        .clone()
+                        .unwrap_or_else(|| "—".to_string()),
+                    property
+                        .selected_confidence
+                        .map(|confidence| confidence.to_string())
+                        .unwrap_or_else(|| "—".to_string()),
+                    format!("{} claim(s)", property.evidence.len()),
+                ]
+            })
+            .collect();
+        print_table(&["Property", "Selected", "Confidence", "Evidence"], rows);
+
+        let rows: Vec<Vec<String>> = explanation
+            .properties
+            .iter()
+            .flat_map(|property| {
+                property.evidence.iter().map(|evidence| {
+                    vec![
+                        evidence.property.clone(),
+                        evidence.value.clone(),
+                        evidence.source.clone(),
+                        evidence.confidence.to_string(),
+                        evidence.kind.to_string(),
+                        evidence.note.clone().unwrap_or_default(),
+                    ]
+                })
+            })
+            .collect();
+        println!();
+        println!("evidence:");
+        print_table(
+            &["Property", "Value", "Source", "Confidence", "Kind", "Note"],
+            rows,
+        );
+    }
+
+    if !explanation.conflicts.is_empty() {
+        println!();
+        println!("conflicts:");
+        for conflict in &explanation.conflicts {
+            println!("  {}: {}", conflict.property, conflict.values.join(" | "));
+        }
+    }
+
+    if !explanation.warnings.is_empty() {
+        println!();
+        for warning in &explanation.warnings {
+            println!("warning: {warning}");
+        }
+    }
+}
+
+fn run_timeline(args: TimelineArgs, loaded: &LoadedConfig, format: OutputFormat) -> Result<()> {
+    let database = open_database(loaded)?;
+    let device = database
+        .find_device(&args.target)?
+        .ok_or_else(|| FindaratError::DeviceNotFound(args.target.clone()))?;
+    let device_id = device
+        .id
+        .ok_or_else(|| FindaratError::Database("device has no id".into()))?;
+    let changes = database.device_changes(device_id, None)?;
+    let timeline = crate::inventory::timeline(&device, &changes, args.limit);
+    match format {
+        OutputFormat::Json => print_json(&timeline)?,
+        OutputFormat::Table => {
+            println!("{}", timeline.name);
+            println!(
+                "id: {}   first seen: {}   last seen: {}   active: {}   ignored: {}",
+                timeline
+                    .device_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                timeline.first_seen.format("%Y-%m-%d %H:%M"),
+                timeline.last_seen.format("%Y-%m-%d %H:%M"),
+                timeline.active,
+                timeline.ignored
+            );
+            println!(
+                "observations: {}   changes: {}   sessions seen: {}",
+                timeline.observation_count, timeline.change_count, timeline.sessions_seen
+            );
+            println!();
+            let rows = timeline
+                .events
+                .iter()
+                .map(|event| {
+                    vec![
+                        event.at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                        event.kind.as_str().to_string(),
+                        event.source.clone(),
+                        event.summary.clone(),
+                    ]
+                })
+                .collect();
+            print_table(&["When", "Type", "Source", "Details"], rows);
+        }
+    }
+    Ok(())
+}
+
 fn print_device_detail(device: &Device) {
     println!("{}", device.display_name());
     println!(
@@ -526,6 +888,17 @@ fn print_device_detail(device: &Device) {
             .map(|id| id.to_string())
             .unwrap_or_else(|| "-".to_string())
     );
+    println!("label: {}", device.label.as_deref().unwrap_or("—"));
+    println!("notes: {}", device.notes.as_deref().unwrap_or("—"));
+    println!(
+        "tags: {}",
+        if device.tags.is_empty() {
+            "—".to_string()
+        } else {
+            device.tags.join(", ")
+        }
+    );
+    println!("ignored: {}", device.ignored);
     println!(
         "ip: {}",
         device
@@ -987,6 +1360,9 @@ fn device_matches(device: &Device, needle: &str) -> bool {
         device.last_ip.map(|ip| ip.to_string()).unwrap_or_default(),
         device.mac.clone().unwrap_or_default(),
         device.hostname.clone().unwrap_or_default(),
+        device.label.clone().unwrap_or_default(),
+        device.notes.clone().unwrap_or_default(),
+        device.tags.join(" "),
         device.vendor.clone().unwrap_or_default(),
         device.os.clone().unwrap_or_default(),
         device.device_type.as_str().to_string(),

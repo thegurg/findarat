@@ -22,6 +22,8 @@ use super::export::ExportEnvelope;
 pub enum ImportFormat {
     Json,
     Sqlite,
+    Nmap,
+    ArpScan,
 }
 
 impl ImportFormat {
@@ -29,6 +31,8 @@ impl ImportFormat {
         match self {
             Self::Json => "json",
             Self::Sqlite => "sqlite",
+            Self::Nmap => "nmap",
+            Self::ArpScan => "arp-scan",
         }
     }
 
@@ -40,6 +44,8 @@ impl ImportFormat {
             .as_deref()
         {
             Some("db") | Some("sqlite") | Some("sqlite3") => Self::Sqlite,
+            Some("xml") => Self::Nmap,
+            Some("arpscan") | Some("arp") => Self::ArpScan,
             _ => Self::Json,
         }
     }
@@ -52,8 +58,10 @@ impl ImportFormat {
             .into()),
             "json" => Ok(Self::Json),
             "sqlite" | "db" => Ok(Self::Sqlite),
+            "nmap" | "xml" => Ok(Self::Nmap),
+            "arp-scan" | "arpscan" | "arp_scan" => Ok(Self::ArpScan),
             other => Err(FindaratError::Validation(format!(
-                "invalid import format {other:?}; expected auto, json, or sqlite"
+                "invalid import format {other:?}; expected auto, json, sqlite, nmap, or arp-scan"
             ))
             .into()),
         }
@@ -161,6 +169,8 @@ pub fn import(
     let envelope = match format {
         ImportFormat::Json => read_json(path)?,
         ImportFormat::Sqlite => read_sqlite(path, database)?,
+        ImportFormat::Nmap => super::nmap::read_nmap(path)?,
+        ImportFormat::ArpScan => super::arpscan::read_arpscan(path)?,
     };
     apply_envelope(database, envelope, path, format, options)
 }
@@ -194,7 +204,7 @@ fn read_sqlite(path: &Path, destination: &Database) -> Result<ExportEnvelope> {
             FindaratError::Validation("cannot import a database into itself".into()).into(),
         );
     }
-    let source = Database::open_read_only(path)?;
+    let source = Database::open_copy(path)?;
     let version = source
         .schema_version()
         .with_context(|| format!("{} is not a findarat database", path.display()))?;
