@@ -416,7 +416,9 @@ evidence_count,observation_count
 ## Import behavior
 
 1. Read and validate the source. JSON errors are reported with the file path.
-   SQLite sources are opened read-only and must contain a findarat schema.
+   SQLite sources are copied read-only into memory and migrated there, so a v1
+   inventory can be read without modifying the source file. Nmap XML and
+   arp-scan text are parsed as data; neither tool is executed.
 2. Reject unsupported schema versions.
 3. Reject importing a database into itself.
 4. Import scan sessions, matching existing sessions by exact `started_at`.
@@ -430,7 +432,7 @@ evidence_count,observation_count
 7. In `--dry-run` mode, perform matching and report counts without writing any
    device, session, evidence, or change rows. A dry run against a missing
    inventory uses an in-memory database and never creates the destination file;
-   against an existing inventory it opens the database read-only.
+   against an existing inventory it reads a migrated in-memory copy.
 
 Imports preserve historical timestamps. They do not synthesize observations
 and do not run change detection for imported snapshots.

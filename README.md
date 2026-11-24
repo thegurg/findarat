@@ -270,8 +270,9 @@ findarat import <PATH> [--import-format auto|json|sqlite|nmap|arp-scan]
 ```
 
 JSON imports accept either a versioned export envelope or a bare array of
-device objects. SQLite imports read an existing findarat database in read-only
-mode and reject importing a database into itself. Nmap imports read XML produced
+device objects. SQLite imports copy an existing findarat database into memory
+in read-only mode and migrate the copy, so the source file is never modified.
+Importing a database into itself is rejected. Nmap imports read XML produced
 by `nmap -oX`, and arp-scan imports read the plain-text output of `arp-scan`.
 Neither external format is executed; only hosts, addresses, ports, service
 guesses, and OS matches are read.

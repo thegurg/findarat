@@ -176,7 +176,9 @@ database.
 Imports validate before writing:
 
 - JSON accepts an envelope or a bare device array.
-- SQLite is opened read-only; importing a database into itself is rejected.
+- Nmap XML and arp-scan text are parsed without invoking those tools.
+- SQLite is copied read-only into memory and migrated there; importing a
+  database into itself is rejected.
 - Schema versions outside the supported range are rejected.
 - Devices without any identity are skipped with a warning.
 - `--dry-run` never writes.

@@ -52,7 +52,7 @@ The full suite currently consists of library unit tests and end-to-end CLI
 tests. A passing run looks like:
 
 ```text
-running 170 tests ... test result: ok
+running 171 tests ... test result: ok
 running 15 tests ... test result: ok
 ```
 
